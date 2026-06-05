@@ -32,7 +32,12 @@ Fetch recent signals from Marlin and write them to local state files so you have
 
    The grant is short-lived (30 minutes, read-only). Never put it on the command line — passing it via argv leaks through `ps`, shell history, and crash logs. The script reads it from its own process environment in step 2.
 
-2. **Run the sync script with the grant in the child process environment.** Execute `sync.py`, which lives alongside this `SKILL.md` in the skill's own directory. Resolve that path **once** at the start of the run (from wherever this skill was loaded — no path variable is assumed, and it should work across agent hosts: Claude Code, Cowork, Desktop, etc.) and reuse it for all subsequent invocations of `sync.py` and `inspect.py`. Don't re-derive the path each time.
+2. **Run the sync script with the grant in the child process environment.** Execute `sync.py`, which lives alongside this `SKILL.md` in the skill's own directory.
+
+   **Resolve the skill directory once, robustly, at the start of the run** — then reuse it for every `sync.py` / `inspect.py` call (don't re-derive each time). No path variable is assumed, and it must work across agent hosts (Claude Code, Cowork, Desktop). Important: the path shown in this skill's header is a *host* path that may not exist inside a sandboxed runtime — e.g. **Cowork mounts the plugin at a different location than the header reports**, so blindly using the header path fails with file-not-found. Resolve it like this:
+   - Try the directory this `SKILL.md` was loaded from. If `sync.py` exists there, use that directory.
+   - If it doesn't, locate the script: `find / -path '*/marlin_sync/sync.py' 2>/dev/null | head -1`, and use the directory containing the result.
+   - Cache that resolved `<skill-dir>` and use it for all subsequent `sync.py` / `inspect.py` invocations this run.
 
    Spawn it with `MARLIN_URL=<base_url>` and `MARLIN_SYNC_GRANT=<grant>` set **only in the subprocess environment** (not exported in your own shell, not on argv). Example in Python:
 

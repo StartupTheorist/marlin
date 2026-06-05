@@ -60,6 +60,34 @@ def _die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def _is_egress_block(text: str) -> bool:
+    """A sandbox egress proxy denying a non-allowlisted host, not a real outage.
+
+    Sandboxed runtimes (e.g. Cowork) route subprocess traffic through an
+    allowlisting proxy that refuses the HTTPS CONNECT tunnel for unlisted hosts.
+    The signatures below distinguish that from the server actually being down.
+    """
+    t = text.lower()
+    return (
+        "tunnel connection failed" in t
+        or "blocked-by-allowlist" in t
+        or ("403" in t and "forbidden" in t)
+    )
+
+
+def _die_network(detail: str) -> None:
+    if _is_egress_block(detail):
+        _die(
+            "network egress blocked by the sandbox, not a server outage "
+            f"({detail}). The server is reachable; this runtime restricts which "
+            "hosts code may contact. Fix: allowlist the server host in your "
+            "client's network settings (e.g. Cowork -> Settings -> Capabilities "
+            "-> Code execution -> allowed domains), or run where outbound network "
+            "is permitted."
+        )
+    _die(f"marlin unreachable: {detail}")
+
+
 def _fetch_page(
     base_url: str, path: str, credential: str, since: str | None
 ) -> dict:
@@ -79,9 +107,9 @@ def _fetch_page(
             _die(f"marlin auth failed: {body}")
         _die(f"marlin http {e.code}: {body}")
     except urllib.error.URLError as e:
-        _die(f"marlin unreachable: {e.reason}")
+        _die_network(str(e.reason))
     except (TimeoutError, OSError) as e:
-        _die(f"marlin request failed: {e}")
+        _die_network(str(e))
 
 
 def _parse_argv(argv: list[str]) -> dict[str, str]:
