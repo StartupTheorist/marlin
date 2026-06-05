@@ -1,0 +1,13 @@
+{
+  "name": "marlin",
+  "owner": {
+    "name": "marlin"
+  },
+  "plugins": [
+    {
+      "name": "marlin",
+      "source": "./plugins/marlin",
+      "description": "Sync recent signals into local state and landscape files for ambient domain awareness."
+    }
+  ]
+}
