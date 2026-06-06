@@ -61,7 +61,7 @@ Fetch recent signals from Marlin and write them to local state files so you have
 
    On any error (auth failure, server unreachable, etc.) it exits non-zero with the error on stderr. Surface the stderr message to the user and stop — do not attempt to recover in the agent loop. For an expired-grant error, mint a fresh grant and retry once.
 
-3. **Stop if no new signals.** If N is 0, the state file's `last_sync` was refreshed by the script. No landscape update is needed.
+3. **Stop if no new signals.** If N is 0, the state file's `last_sync` was refreshed by the script. No landscape update is needed. **Leave `marlin_landscape.json` untouched — including its `as_of`.** `as_of` records *when the landscape content was synthesized*, not when you last polled; `last_sync` in the state file is the "when we last fetched" timestamp. A no-new-signals run refreshes `last_sync` only, so a stale `as_of` on a skip run is correct, not a bug.
 
 ## Landscape update (only when new signals arrived)
 
@@ -81,14 +81,16 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
 
 5. **Drill selectively.** For signals you plan to narrate into themes or cite by `id`, get the full `what_changed` / `why_it_matters`. The cleanest way is `python <skill-dir>/inspect.py --ids sig_A,sig_B,sig_C` — it dumps full records for the listed IDs without you needing to Read or parse `marlin_state.json`. You can also Read `marlin_state.json` directly for ad-hoc inspection, or call `get_signal(id)` via the MCP for source provenance (URLs, snippets) which `inspect.py --ids` doesn't include. Use the **real ULIDs** from the triage index — never invent placeholders like `sig_1`.
 
-   **Required for `urgent_signals`.** For every signal you put in `urgent_signals`, you MUST pull its full record (via `inspect.py --ids` or `get_signal(id)`) before writing the `why` line. The whole point of the field is a trusted, source-grounded "act on this" — paraphrasing the title from the triage index defeats it. If you can't justify the urgency from `what_changed` / `why_it_matters`, the signal doesn't belong in `urgent_signals`.
+   **Required for `urgent_signals`.** For every signal you put in `urgent_signals`, you MUST pull its full record (via `inspect.py --ids` or `get_signal(id)`) before writing the `why` line. The whole point of the field is a trusted, source-grounded "act on this" — paraphrasing the title from the triage index defeats it. If you can't justify the urgency from `what_changed` / `why_it_matters`, the signal doesn't belong in `urgent_signals`. To get the right *candidate set* in the first place, run `python <skill-dir>/inspect.py --urgent-top 5` — it pre-emits, per channel, the `handling=urgent` signals already sorted (importance desc, ties by `updated_seq` desc) and capped at 5, so you don't hand-apply the cap and sort.
 
 6. **Read prior landscape if it exists.** Read `marlin_landscape.json` if present; skip if this is cold-start.
 
 7. **Identify new signals.**
-   - If a prior landscape exists, new signals are those in the triage index with `updated_seq > landscape.updated_through_seq` (`updated_through_seq` is a single top-level value across all channels).
+   - If a prior landscape exists, new signals are those in the triage index with `updated_seq > landscape.updated_through_seq` (`updated_through_seq` is a single top-level value across all channels). Don't eyeball this — run `python <skill-dir>/inspect.py --since-seq <updated_through_seq>` (add `--by-channel` to group) and it emits only the new signals.
    - If no prior landscape, treat all signals in the state file as new (first landscape build — see cold-start note below).
    - **Bucket the new signals by `channel`** — each channel's section in step 8 is synthesized from its own signals only.
+
+   **`seq` gaps are expected — the threshold is gap-safe.** `updated_seq` is a single global monotonic counter on the server (`MAX+1`, reassigned on *every* insert and update), so you'll see non-contiguous numbers in any one view (e.g. 33, 38, 45): an updated signal abandons its old number, and merged / deduped / cross-channel / trimmed signals consume numbers that never appear in your state. This is normal. The `updated_seq > updated_through_seq` comparison is a strictly-greater test on a monotonic counter, so gaps never break it — never assume the next signal is `N+1`.
 
 8. **Synthesize the updated landscape — once per channel.** The landscape is **channel-keyed** (see step 9): produce an independent section for each channel from `inspect.py --channels`. **Every rule below operates within a single channel's signals** — themes, entities, and urgent items never mix across channels, because each signal belongs to exactly one channel. Run the same procedure for each channel:
 
@@ -100,21 +102,23 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
      - Update the channel's `summary` to reflect what actually changed, not a full rewrite.
    - **No prior landscape (cold-start)**: see the cold-start note below; synthesize each channel independently — never narrate one channel's signals into another channel's section.
 
-   In both modes, populate each channel's `urgent_signals` from **that channel's** `handling=urgent` signals. **Cap at 5 per channel; sort by `importance` descending, ties broken by `updated_seq` descending.** Each entry's `why` is a single line — the concrete reason this signal needs attention now.
+   In both modes, populate each channel's `urgent_signals` from **that channel's** `handling=urgent` signals. **Cap at 5 per channel; sort by `importance` descending, ties broken by `updated_seq` descending** (use `inspect.py --urgent-top 5` to get this set pre-sorted and capped). Each entry's `why` is a single line — the concrete reason this signal needs attention now. **If an urgent_signal persisted from the prior landscape, reuse its prior `why` verbatim** unless new info changes the framing — re-deriving the same `why` with different wording each run is needless churn.
 
-   **Determinism rules, applied independently within each channel** (so reruns produce stable shape):
-   - `active_themes` is sorted by **max `importance` across the theme's signals** descending; first tiebreak is `signal_ids` count descending; final tiebreak is max `updated_seq` across the theme's signals descending. (Sorting by raw count alone lets a backfill burst from one source crowd out hot clusters.)
-   - **Theme exclusivity**: each `signal_id` appears in **at most one** `active_themes` entry. (A signal has one channel, so this is naturally within-channel.) If a signal could fit two themes, place it in the higher-importance theme; tiebreak by `signal_ids` count descending; final tiebreak by theme name lexicographically.
-   - `entities_to_watch` selection: include entities that appear in **≥2 signals in this channel** AND are **not named in any of this channel's `active_themes` entry `theme` strings** (i.e., not the central subject of a theme in this channel). Themes are about events; entities_to_watch is about names recurring across this channel's events without yet being the center of a theme.
-   - `entities_to_watch` uses entity names **verbatim from signals' `entity_tags`** — do not paraphrase, normalize casing, or merge variants. If two `entity_tags` strings refer to the same real-world entity, treat them as separate entries.
+   **Determinism checklist, applied independently within each channel** (so reruns produce stable shape). This is also exactly what `validate.py` checks in step 10 — apply it as you write, then let the script confirm it:
 
-   `as_of` and `updated_through_seq` are **single top-level values for the whole file** (not per channel) — see step 9. `as_of` is **wall-clock UTC at the moment you write the landscape**, ISO8601 seconds with the trailing `Z` (`YYYY-MM-DDTHH:MM:SSZ`); do not copy `last_sync` from `marlin_state.json`.
+   1. **`active_themes` order** — sort by **max `importance` across the theme's signals** descending; first tiebreak `signal_ids` count descending; final tiebreak max `updated_seq` across the theme's signals descending. (Sorting by raw count alone lets a backfill burst from one source crowd out hot clusters — don't simplify this to a plain count sort.) Get any theme's key with `inspect.py --theme-key <id,id,...>` (prints `max_importance`, `count`, `max_updated_seq`) instead of computing it by hand.
+   2. **Theme exclusivity** — each `signal_id` appears in **at most one** `active_themes` entry. (A signal has one channel, so this is naturally within-channel.) If a signal could fit two themes, place it in the higher-importance theme; tiebreak by `signal_ids` count descending; final tiebreak by theme name lexicographically.
+      - *Worked example:* an "OpenClaw browser-agent ban" signal could fit both a `security` theme and an `anthropic-business` theme. Resolve deterministically: pick the theme with the **higher max importance**; if those tie, the one with **more `signal_ids`**; if still tied, the **lexicographically first theme name** (`anthropic-business` < `security`). It lands in exactly one — never both.
+   3. **`entities_to_watch` selection** — include entities that appear in **≥2 signals in this channel** AND are **not named in any of this channel's `active_themes` `theme` strings** (i.e. not the central subject of a theme here). Themes are about events; entities_to_watch is about names recurring across events without yet being a theme's center. `inspect.py --entity-candidates` pre-emits the ≥2-signal candidates per channel (verbatim, with supporting IDs); you still apply the not-in-a-theme-string exclusion.
+   4. **`entities_to_watch` verbatim** — use entity names **verbatim from signals' `entity_tags`**; do not paraphrase, normalize casing, or merge variants. If two `entity_tags` strings refer to the same real-world entity, treat them as separate entries.
+
+   `as_of` and `updated_through_seq` are **single top-level values for the whole file** (not per channel) — see step 9. Set `as_of` from `python <skill-dir>/inspect.py --now` (ISO-8601 UTC seconds with trailing `Z`, `YYYY-MM-DDTHH:MM:SSZ`) — run it right before you write the file so it reflects synthesis time. Do **not** shell out to `date -u`, and do **not** copy `last_sync` from `marlin_state.json`.
 
    **Cold-start note.** Cold-start runs **per channel** — apply these steps to each channel's signals independently. Within a channel, if it has more than ~15 signals do not summarize everything as one paragraph. Instead:
    1. Within the channel, group its signals by `signal_type` and overlapping `entity_tags`.
    2. Identify clusters of ≥3 signals and narrate each cluster as a theme.
    3. Apply the `entities_to_watch` selection rule (≥2 signals in the channel, not already in a theme).
-   4. Singletons that fit neither bucket get dropped from the landscape — they'll still live in `marlin_state.json` for ad-hoc reference.
+   4. Singletons that fit neither bucket get dropped from the landscape — they'll still live in `marlin_state.json` for ad-hoc reference. **Report the count in the conversation** (not in the landscape file): e.g. "N signals not narrated into the landscape; available in state if you want them." So the dropped signals are visible without bloating the synthesized view.
    5. Write the channel's `summary` as a short paragraph naming its top 2-3 clusters; don't try to cover every theme in prose.
 
 9. **Write `marlin_landscape.json`** (schema **version 2 — channel-keyed**):
@@ -156,6 +160,16 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
     ```
 
     Detection heuristic: signals in **different** channels that share **≥2 `entity_tags`** *and* describe the **same event**. The shared-tags test alone is not sufficient — two distinct stories that both mention a prominent entity (e.g. "Anthropic") are **not** a linked event; require that the underlying event is actually the same before linking. Omit `cross_channel` entirely when there are no links (this is the common case — for the current `ai_builder` / `marketer` / `product` channels, genuine cross-channel duplicate events are effectively nonexistent because the domains barely overlap). Reassess if finer-grained or overlapping channels are added later.
+
+11. **Validate, then fix.** After writing `marlin_landscape.json`, run the linter as a subprocess:
+
+    ```
+    python <skill-dir>/validate.py
+    ```
+
+    It reads the landscape you just wrote plus `marlin_state.json` and checks the whole step-8 determinism checklist mechanically — theme exclusivity, theme order, the `entities_to_watch` rule, the `urgent_signals` cap/sort/handling, `as_of` format, `updated_through_seq`, referential integrity, and cross-channel links. It prints `OK` (exit 0) or one `- <violation>` line per problem (exit non-zero).
+
+    **If it prints `OK`, you're done.** If it reports violations, **fix the landscape and re-run until it prints `OK`** (the violations are precise — each names the channel, the field, and the rule). Don't rely on having applied the rules perfectly by hand; this step exists because the rules are easy to miss under load. Bound it to a few attempts — if a violation won't clear, surface it to the user rather than looping.
 
 ## Safety instructions
 
