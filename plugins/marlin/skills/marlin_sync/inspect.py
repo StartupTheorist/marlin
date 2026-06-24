@@ -158,6 +158,59 @@ def _as_float(v: object) -> float:
     return float(v) if isinstance(v, (int, float)) else 0.0
 
 
+# Corporate/legal suffix tokens trimmed when they appear as the trailing token of an
+# entity name (after lowercasing). Closed, conservative set — see A4.3.
+_ENTITY_SUFFIX_TOKENS = frozenset(
+    {"inc", "llc", "ltd", "corp", "co", "gmbh", "plc", "ag", "sa"}
+)
+
+
+def normalize_entity_key(name: str) -> str:
+    """Return the normalized GROUPING KEY for an entity-tag string (A4 scaffolding).
+
+    A4 (entity normalization) collapses trivial string variants of the same
+    real-world entity for *counting and grouping* in `entities_to_watch`, while the
+    string shown to the consumer stays the first-seen verbatim `entity_tags` value.
+    This function computes only the key; it never produces a display string.
+
+    Spec (see docs/features/ingest_algo/implementation_plan.md §A4.3 — source of truth):
+      1. strip + collapse internal whitespace
+      2. lowercase (casefold)
+      3. trim a leading article "the" and a single closed set of trailing
+         corporate/legal suffix tokens (inc/llc/ltd/corp/co/gmbh/plc/ag/sa),
+         comma- and period-insensitive
+      4. trim trailing punctuation left behind
+
+    Deliberately does NOT strip version/qualifier tokens or do prefix/alias/fuzzy
+    collapse, so distinct entities are never merged:
+      normalize_entity_key("GPT-5.4")        != normalize_entity_key("GPT-5")
+      normalize_entity_key("GPT-5.4-Cyber")  != normalize_entity_key("GPT-5.4")
+      normalize_entity_key("Mozilla Firefox")!= normalize_entity_key("Mozilla")
+    while collapsing the genuine trivial variants:
+      normalize_entity_key("Anthropic") == normalize_entity_key("Anthropic, Inc.")
+                                        == normalize_entity_key("  anthropic ")
+
+    NOTE: scaffolding only — not yet wired into --entity-candidates (A4 Phase 2).
+    """
+    key = " ".join(name.split()).casefold()
+
+    # Leading article.
+    if key.startswith("the "):
+        key = key[4:]
+
+    # Trailing corporate/legal suffix: strip the last token if (sans trailing
+    # period/comma) it is in the closed set. Loop once — names with two stacked
+    # suffixes are not observed and stacking risks over-collapse.
+    tokens = key.split()
+    if len(tokens) > 1:
+        last = tokens[-1].rstrip(".,")
+        if last in _ENTITY_SUFFIX_TOKENS:
+            tokens = tokens[:-1]
+            key = " ".join(tokens)
+
+    return key.rstrip(" .,")
+
+
 def _parse_argv(argv: list[str]) -> dict[str, object]:
     """Parse flags. Value flags: --ids, --channel, --since-seq, --theme-key
     (also `--flag=value`). Optional-value flag: --urgent-top (an int may
