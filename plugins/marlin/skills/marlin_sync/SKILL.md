@@ -34,10 +34,15 @@ Fetch recent signals from Marlin and write them to local state files so you have
 
 2. **Run the sync script with the grant in the child process environment.** Execute `sync.py`, which lives alongside this `SKILL.md` in the skill's own directory.
 
-   **Resolve the skill directory once, robustly, at the start of the run** — then reuse it for every `sync.py` / `inspect.py` call (don't re-derive each time). No path variable is assumed, and it must work across agent hosts (Claude Code, Cowork, Desktop). Important: the path shown in this skill's header is a *host* path that may not exist inside a sandboxed runtime — e.g. **Cowork mounts the plugin at a different location than the header reports**, so blindly using the header path fails with file-not-found. Resolve it like this:
-   - Try the directory this `SKILL.md` was loaded from. If `sync.py` exists there, use that directory.
-   - If it doesn't, locate the script: `find / -path '*/marlin_sync/sync.py' 2>/dev/null | head -1`, and use the directory containing the result.
-   - Cache that resolved `<skill-dir>` and use it for all subsequent `sync.py` / `inspect.py` invocations this run.
+   **Resolve two paths once, robustly, at the start of the run** — the **skill directory** (where the scripts live) and the **state directory** (where state + landscape persist) — then reuse both for the whole run (don't re-derive). They must work across hosts (Claude Code, Cowork, Desktop).
+
+   *Skill directory.* The path in this skill's header is a *host* path that may not exist inside a sandboxed runtime — e.g. **Cowork mounts the plugin elsewhere than the header reports**, so blindly using the header path fails with file-not-found. Resolve it:
+   - Try the directory this `SKILL.md` was loaded from. If `sync.py` exists there, use it.
+   - Otherwise locate the script, scoping the search to likely roots first to avoid a full-filesystem scan: `find "$HOME" /sessions /workspace -path '*/marlin_sync/sync.py' 2>/dev/null | head -1`; only if that returns nothing, fall back to `find / -path '*/marlin_sync/sync.py' 2>/dev/null | head -1`. Use the directory containing the result.
+   - In sandboxed hosts where the **Read tool** can't open files at the resolved path (e.g. Cowork `/sessions/...`), read the scripts via the shell (`cat <skill-dir>/sync.py`) instead.
+   - Cache that `<skill-dir>` for all `sync.py` / `inspect.py` / `validate.py` calls this run.
+
+   *State directory.* Run `python <skill-dir>/inspect.py --state-dir` and cache the result as `<state-dir>`. This is where `marlin_state.json` (raw rolling window) and `marlin_landscape.json` (synthesized view) live — a **stable** location (default `~/.marlin/`, override with `MARLIN_STATE_DIR`), deliberately **not** the cwd, so prior state and landscape survive a run launched from any working directory (e.g. a scheduled run, whose cwd is arbitrary). The scripts resolve state themselves; **you** read and write the *landscape* at `<state-dir>/marlin_landscape.json`.
 
    Spawn it with `MARLIN_URL=<base_url>` and `MARLIN_SYNC_GRANT=<grant>` set **only in the subprocess environment** (not exported in your own shell, not on argv). Example in Python:
 
@@ -52,7 +57,7 @@ Fetch recent signals from Marlin and write them to local state files so you have
 
    Bash equivalent for inline invocation: `MARLIN_URL=... MARLIN_SYNC_GRANT=... python <skill-dir>/sync.py` (the leading assignments scope the vars to the single command, not your session).
 
-   The script reads `marlin_state.json` in the current working directory, fetches new signals via the REST API, pages as needed, merges, trims to the rolling window of 100, and writes the state file. All mechanical — no LLM judgment required.
+   The script reads/writes `marlin_state.json` in `<state-dir>` (it resolves that itself — no path needed), fetches new signals via the REST API, pages as needed, merges, trims to the rolling window of 100, and writes the state file. All mechanical — no LLM judgment required.
 
    It prints one line to stdout:
    ```
@@ -83,7 +88,7 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
 
    **Required for `urgent_signals`.** For every signal you put in `urgent_signals`, you MUST pull its full record (via `inspect.py --ids` or `get_signal(id)`) before writing the `why` line. The whole point of the field is a trusted, source-grounded "act on this" — paraphrasing the title from the triage index defeats it. If you can't justify the urgency from `what_changed` / `why_it_matters`, the signal doesn't belong in `urgent_signals`. To get the right *candidate set* in the first place, run `python <skill-dir>/inspect.py --urgent-top 5` — it pre-emits, per channel, the `handling=urgent` signals already sorted (importance desc, ties by `updated_seq` desc) and capped at 5, so you don't hand-apply the cap and sort.
 
-6. **Read prior landscape if it exists.** Read `marlin_landscape.json` if present; skip if this is cold-start.
+6. **Read prior landscape if it exists.** Read `<state-dir>/marlin_landscape.json` if present; skip if this is cold-start. (Resolving `<state-dir>` — not the cwd — is what makes diff mode actually pick up the prior run; a cwd-relative read silently cold-starts every scheduled run.)
 
 7. **Identify new signals.**
    - If a prior landscape exists, new signals are those in the triage index with `updated_seq > landscape.updated_through_seq` (`updated_through_seq` is a single top-level value across all channels). Don't eyeball this — run `python <skill-dir>/inspect.py --since-seq <updated_through_seq>` (add `--by-channel` to group) and it emits only the new signals.
@@ -122,7 +127,7 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
    4. Singletons that fit neither bucket get dropped from the landscape — they'll still live in `marlin_state.json` for ad-hoc reference. **Report the count in the conversation** (not in the landscape file): e.g. "N signals not narrated into the landscape; available in state if you want them." So the dropped signals are visible without bloating the synthesized view.
    5. Write the channel's `summary` as a short paragraph naming its top 2-3 clusters; don't try to cover every theme in prose.
 
-9. **Write `marlin_landscape.json`** (schema **version 2 — channel-keyed**):
+9. **Write `<state-dir>/marlin_landscape.json`** (schema **version 2 — channel-keyed**; write it in `<state-dir>`, the same place step 6 read the prior one and the validator reads it from — not the cwd):
    ```json
    {
      "version": 2,
@@ -168,7 +173,9 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
     python <skill-dir>/validate.py
     ```
 
-    It reads the landscape you just wrote plus `marlin_state.json` and checks the whole step-8 determinism checklist mechanically — theme exclusivity, theme order, the `entities_to_watch` rule, the `urgent_signals` cap/sort/handling, `as_of` format, `updated_through_seq`, referential integrity, and cross-channel links. It prints `OK` (exit 0) or one `- <violation>` line per problem (exit non-zero).
+    It reads the landscape you just wrote plus `marlin_state.json` (both from `<state-dir>`, resolved automatically) and checks the whole step-8 determinism checklist mechanically — theme exclusivity, theme order, the `entities_to_watch` rule, the `urgent_signals` cap/sort/handling, `as_of` format, `updated_through_seq`, referential integrity, and cross-channel links. It prints `OK` (exit 0) or one `- <violation>` line per problem (exit non-zero).
+
+    **`validate.py` is the executable spec for landscape shape.** If any determinism rule above is ambiguous as written, read `<skill-dir>/validate.py` and follow it exactly rather than guessing — its checks are the source of truth, and reading it first is what lets a run converge in a single write→validate pass instead of iterating.
 
     **If it prints `OK`, you're done.** If it reports violations, **fix the landscape and re-run until it prints `OK`** (the violations are precise — each names the channel, the field, and the rule). Don't rely on having applied the rules perfectly by hand; this step exists because the rules are easy to miss under load. Bound it to a few attempts — if a violation won't clear, surface it to the user rather than looping.
 

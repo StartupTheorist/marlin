@@ -2,8 +2,10 @@
 """Marlin sync — mechanical ingestion, stdlib only.
 
 Fetches new signals from the Marlin REST API, merges into marlin_state.json
-in the current working directory, trims to a rolling window, and prints a
-one-line summary. Designed to be invoked by the marlin-sync skill so that
+in a stable state directory (MARLIN_STATE_DIR, default ~/.marlin/ — NOT the
+cwd, so diff-mode survives scheduled runs launched from anywhere), trims to a
+rolling window, and prints a one-line summary. Designed to be invoked by the
+marlin-sync skill so that
 the mechanical steps (fetch, page, merge, trim, write) run outside the LLM
 loop and don't pay token cost proportional to payload size.
 
@@ -39,8 +41,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE_PATH = Path("marlin_state.json")
-BACKUP_PATH = Path("marlin_state.json.bak")
+# State lives in a stable directory, not the cwd, so a scheduled run launched
+# from an arbitrary/ephemeral working dir still finds prior state (otherwise it
+# cold-starts every run — re-syncing the whole window and defeating diff mode).
+# inspect.py and validate.py resolve the same directory the same way.
+STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
+STATE_PATH = STATE_DIR / "marlin_state.json"
+BACKUP_PATH = STATE_DIR / "marlin_state.json.bak"
 WINDOW = 100
 PAGE_LIMIT = 100
 MAX_PAGES = 50
@@ -199,6 +206,8 @@ def main() -> None:
 
     now = _iso_now()
     prefix = "restored from backup; " if corrupt else ""
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)  # ensure the state dir exists before writing
 
     if new_count == 0:
         state["version"] = 1

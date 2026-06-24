@@ -3,7 +3,8 @@
 the skill's determinism rules.
 
 Reads the written artifact (`marlin_landscape.json`) AND ground truth
-(`marlin_state.json`) from the current working directory, then checks every
+(`marlin_state.json`) from the shared state directory (MARLIN_STATE_DIR,
+default ~/.marlin/), then checks every
 rule from SKILL.md step 8/9 mechanically — so the agent doesn't rely on
 remembering to apply them by hand. The v2 landscape is channel-keyed; every
 per-channel rule runs within each `channels.<id>` section.
@@ -39,12 +40,17 @@ Output:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-STATE_PATH = Path("marlin_state.json")
-LANDSCAPE_PATH = Path("marlin_landscape.json")
+# Both files live in the shared state directory (MARLIN_STATE_DIR, else
+# ~/.marlin), the same one sync.py/inspect.py resolve — so the validator lints
+# the landscape the skill actually wrote, regardless of cwd.
+STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
+STATE_PATH = STATE_DIR / "marlin_state.json"
+LANDSCAPE_PATH = STATE_DIR / "marlin_landscape.json"
 URGENT_CAP = 5
 AS_OF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 

@@ -7,7 +7,7 @@
     {
       "name": "marlin",
       "source": "./plugins/marlin",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "description": "Sync recent signals into local state and landscape files for ambient domain awareness."
     }
   ]

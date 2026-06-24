@@ -74,11 +74,16 @@ Output:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE_PATH = Path("marlin_state.json")
+# Resolve the state directory the same way sync.py does (MARLIN_STATE_DIR, else
+# ~/.marlin) so reads find what sync.py wrote regardless of cwd. `--state-dir`
+# prints it so the skill can read/write the landscape in the same place.
+STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
+STATE_PATH = STATE_DIR / "marlin_state.json"
 URGENT_TOP_DEFAULT = 5
 
 
@@ -228,6 +233,7 @@ def _parse_argv(argv: list[str]) -> dict[str, object]:
         "--by-channel": "by_channel",
         "--entity-candidates": "entity_candidates",
         "--now": "now",
+        "--state-dir": "state_dir",
     }
     i = 0
     while i < len(argv):
@@ -352,9 +358,12 @@ def _print_urgent_top(signals: list[dict], n: int) -> None:
 def main() -> None:
     args = _parse_argv(sys.argv[1:])
 
-    # --now needs no state file.
+    # --now / --state-dir need no state file.
     if args.get("now"):
         print(_iso_now())
+        return
+    if args.get("state_dir"):
+        print(str(STATE_DIR))
         return
 
     state = _load_state()
