@@ -44,6 +44,8 @@ Fetch recent signals from Marlin and write them to local state files so you have
 
    *State directory.* Run `python <skill-dir>/inspect.py --state-dir` and cache the result as `<state-dir>`. This is where `marlin_state.json` (raw rolling window) and `marlin_landscape.json` (synthesized view) live — a **stable** location (default `~/.marlin/`, override with `MARLIN_STATE_DIR`), deliberately **not** the cwd, so prior state and landscape survive a run launched from any working directory (e.g. a scheduled run, whose cwd is arbitrary). The scripts resolve state themselves; **you** read and write the *landscape* at `<state-dir>/marlin_landscape.json`.
 
+   **Persistence check on sandboxed hosts.** The default `~/.marlin/` is correct for long-lived hosts (a laptop, server, or cron box). But on an **ephemeral sandbox** the resolved `<state-dir>` may sit under a teardown-on-exit home — e.g. Cowork resolves it to `/sessions/<id>/.marlin`, which is **wiped between sessions**, so every scheduled run there cold-starts. If `<state-dir>` looks like a temporary sandbox path **and** a mounted/persistent folder is available (e.g. the user's project folder), set `MARLIN_STATE_DIR` to that folder before invoking the scripts so state actually carries over. When in doubt, ask the user where state should persist.
+
    Spawn it with `MARLIN_URL=<base_url>` and `MARLIN_SYNC_GRANT=<grant>` set **only in the subprocess environment** (not exported in your own shell, not on argv). Example in Python:
 
    ```python
@@ -80,7 +82,7 @@ Diff-mode: update the prior landscape rather than rebuilding from scratch. This 
 
    Newest first, one line per signal. This is your primary working view — do **not** Read `marlin_state.json` directly as your first move. A cold-start state file can exceed the Read tool's context cap; the triage index always fits.
 
-   Example invocation: `python <skill-dir>/inspect.py` (no env vars needed; it reads `marlin_state.json` in the current working directory).
+   Example invocation: `python <skill-dir>/inspect.py` (no env vars needed; it resolves `marlin_state.json` from `<state-dir>` itself).
 
    **Marlin is multi-channel, and the landscape is synthesized per channel** (each signal carries a `channel` — field 6 — and belongs to exactly one). Enumerate the channels present in state with `python <skill-dir>/inspect.py --channels` (prints `<channel>\t<count>`, most active first); you will produce one landscape section per channel in step 8. To read the index grouped, use `--by-channel`; to focus on one channel, `--channel <id>`.
 

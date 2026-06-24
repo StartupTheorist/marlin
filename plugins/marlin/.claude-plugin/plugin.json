@@ -1,5 +1,5 @@
 {
   "name": "marlin",
   "description": "Sync recent signals into local state and landscape files for ambient domain awareness.",
-  "version": "0.1.5"
+  "version": "0.1.6"
 }
