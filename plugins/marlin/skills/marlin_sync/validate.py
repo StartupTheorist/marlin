@@ -13,7 +13,9 @@ Checks:
   * shape — version == 2; `channels` is a non-empty object; each channel has
     summary / urgent_signals / active_themes / entities_to_watch.
   * referential integrity — every id / signal_id referenced exists in state,
-    and the referenced signal's `channel` matches the section key.
+    the referenced signal's `channel` matches the section key, and it is not a
+    retired (`status="superseded"`) signal (A8b: retired signals are dropped, not
+    referenced).
   * theme exclusivity — each signal_id appears in ≤1 active_themes entry per
     channel.
   * active_themes order — matches the composite sort key (max importance desc,
@@ -73,6 +75,11 @@ def _as_float(v: object) -> float:
     return float(v) if isinstance(v, (int, float)) else 0.0
 
 
+def _is_active(s: dict) -> bool:
+    """A8b: a retired (superseded) signal must not appear in the landscape."""
+    return s.get("status", "active") == "active"
+
+
 def _theme_key(signal_ids: list[str], by_id: dict[str, dict]) -> tuple[float, int, int]:
     members = [by_id[sid] for sid in signal_ids if sid in by_id]
     max_imp = max((_as_float(s.get("importance")) for s in members), default=0.0)
@@ -127,7 +134,7 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict]) -> list[s
         if key not in section:
             v.append(f"[{cid}] missing '{key}'")
 
-    chan_signals = [s for s in by_id.values() if s.get("channel") == cid]
+    chan_signals = [s for s in by_id.values() if s.get("channel") == cid and _is_active(s)]
 
     def _ref_ok(sid: str, where: str) -> bool:
         s = by_id.get(sid)
@@ -138,6 +145,12 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict]) -> list[s
             v.append(
                 f"[{cid}] {where} references signal {sid!r} from another "
                 f"channel ({s.get('channel')!r})"
+            )
+            return False
+        if not _is_active(s):
+            v.append(
+                f"[{cid}] {where} references {s.get('status')!r} signal {sid!r} — "
+                "retired (superseded) signals must be dropped from the landscape (A8b)"
             )
             return False
         return True
@@ -228,6 +241,11 @@ def _validate_cross_channel(cc: dict, by_id: dict[str, dict]) -> list[str]:
             s = by_id.get(sid)
             if s is None:
                 v.append(f"[cross_channel] unknown signal id {sid!r}")
+            elif not _is_active(s):
+                v.append(
+                    f"[cross_channel] links {s.get('status')!r} signal {sid!r} — "
+                    "retired (superseded) signals must be dropped (A8b)"
+                )
             else:
                 chans.add(s.get("channel"))
         if len(chans) < 2:

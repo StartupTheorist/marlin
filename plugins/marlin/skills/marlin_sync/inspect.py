@@ -159,6 +159,16 @@ def _newest_first(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda s: s.get("updated_seq", 0), reverse=True)
 
 
+def _is_active(s: dict) -> bool:
+    """A signal belongs in the triage index / landscape unless it's been retired.
+
+    A8b: the server retires a signal (`status="superseded"`) when a later event
+    supersedes it, but keeps *delivering* it (flagged, updated_seq bumped) so the
+    skill can drop it — "deliver-then-drop". Here is where it's dropped. Missing
+    status is treated as active (pre-A8b state, or an old server)."""
+    return s.get("status", "active") == "active"
+
+
 def _as_float(v: object) -> float:
     return float(v) if isinstance(v, (int, float)) else 0.0
 
@@ -367,21 +377,27 @@ def main() -> None:
         return
 
     state = _load_state()
-    signals = state.get("signals", [])
+    all_signals = state.get("signals", [])
 
+    # --ids and --theme-key take explicit ids and are drill/lookup tools, so they
+    # operate on the FULL state — you can still inspect a retired (superseded)
+    # signal by id. Every aggregate/triage view below operates on active-only, so
+    # retired signals never enter the landscape (A8b deliver-then-drop).
     if "ids" in args:
-        _print_ids(signals, str(args["ids"]))
-        return
-
-    # --channels: enumerate channels in the full state (ignores --channel filter).
-    if args.get("channels"):
-        _print_channels(signals)
+        _print_ids(all_signals, str(args["ids"]))
         return
 
     # --theme-key: look up across the full state (themes are within a channel,
     # but the IDs are unambiguous, so no channel filter is needed).
     if "theme_key" in args:
-        _print_theme_key(signals, str(args["theme_key"]))
+        _print_theme_key(all_signals, str(args["theme_key"]))
+        return
+
+    signals = [s for s in all_signals if _is_active(s)]
+
+    # --channels: enumerate channels in the active state (ignores --channel filter).
+    if args.get("channels"):
+        _print_channels(signals)
         return
 
     # --channel: filter the working set to one channel (applies to the helpers
