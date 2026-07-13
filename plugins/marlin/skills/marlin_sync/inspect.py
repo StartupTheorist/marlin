@@ -27,6 +27,11 @@ channel, so the landscape is synthesized per channel):
                       `updated_seq > N`. The diff-mode filter: pass the prior
                       landscape's `updated_through_seq` to see only what's new.
                       Composes with --channel / --by-channel.
+    --retired-since <N>
+                      List full-state signals retired after sequence N, with
+                      their recorded successor where present. Composes with
+                      --channel so the consumer can inspect a channel's
+                      retirements and spot a wrong supersede.
 
 Landscape-synthesis helpers (pre-compute the deterministic selection/sort the
 skill's rules require, so the agent doesn't do it by hand):
@@ -34,9 +39,20 @@ skill's rules require, so the agent doesn't do it by hand):
     --entity-candidates   Per channel, list entities qualifying for
                           `entities_to_watch` under the count rule (appear in
                           ≥2 signals in that channel), names taken verbatim
-                          from `entity_tags`, with supporting signal IDs. The
-                          agent still applies the "not named in any theme
-                          string" exclusion (which needs theme membership).
+                          from `entity_tags`, with supporting signal IDs.
+                          With `--channel <id> --themes <blob>` also given,
+                          instead emits the final paste-ready
+                          `entities_to_watch` JSON array for that one channel
+                          — the theme-subject exclusion applied, the set
+                          complete (no top-N cap) — meant to be pasted
+                          verbatim as the channel's `entities_to_watch`.
+        --themes <blob>       The channel's draft theme names, joined into
+                               one string (any separator; matched as a
+                               lowercased substring check, same as
+                               validate.py). Only meaningful with
+                               --entity-candidates and --channel; without
+                               --channel the "final set" is undefined
+                               (entities_to_watch is per-channel).
     --urgent-top [N]      Per channel, list `handling=urgent` signals with the
                           deterministic sort applied (importance desc, ties by
                           updated_seq desc), capped at N (default 5), noting any
@@ -44,13 +60,39 @@ skill's rules require, so the agent doesn't do it by hand):
     --theme-key A,B,C     Given a theme's signal IDs, print its composite sort
                           key — `max_importance`, `count`, `max_updated_seq` —
                           so themes can be ordered without hand-computing.
+    --landscape-survivors Cross-reference the prior `marlin_landscape.json`
+                          against state, reporting which referenced IDs
+                          survived, were retired, or were trimmed from the
+                          rolling window.
+    --archive             Read mode over the local archive (everything
+                          sync.py has ever evicted from the rolling window —
+                          see marlin_archive/<YYYY-MM>.jsonl), instead of
+                          marlin_state.json. Reads every monthly file,
+                          de-duplicates by signal `id` (keeping the entry with
+                          the newest `archived_at`, since a retried sync can
+                          append a duplicate), and prints one
+                          `archived:<YYYY-MM-DD> | ...` line per signal,
+                          sorted by `archived_at` descending then
+                          `updated_seq` descending. Malformed lines are
+                          skipped and counted; if any were skipped, a warning
+                          is printed to stderr after the output (exit 0
+                          regardless). Missing/empty archive dir -> empty
+                          output, exit 0. Composes with --channel, plus these
+                          archive-only value flags:
+                            --entity <text>       Case-insensitive substring
+                                                   match against entity_tags.
+                            --signal-type <t>      Exact match on signal_type.
+                            --since <YYYY-MM-DD>   Keep archived_at[:10] >= this.
+                            --until <YYYY-MM-DD>   Keep archived_at[:10] <= this.
+                          --entity/--signal-type/--since/--until are ignored
+                          outside --archive mode.
     --now                 Print the current UTC time as ISO-8601 seconds with a
                           trailing Z (`YYYY-MM-DDTHH:MM:SSZ`), for the
                           landscape's `as_of`. Needs no state file.
 
-Precedence: --now > --ids > --channels > --theme-key > --entity-candidates >
---urgent-top > --by-channel/default (the latter honoring --channel and
---since-seq).
+Precedence: --now > --ids > --channels > --theme-key > --retired-since >
+--landscape-survivors > --archive > --entity-candidates > --urgent-top >
+--by-channel/default (the latter honoring --channel and --since-seq).
 
 Note on `seq` gaps: `updated_seq` is a single global monotonic counter on the
 server (MAX+1, reassigned on every insert AND update), so numbers are routinely
@@ -66,15 +108,19 @@ Stdlib only so it works anywhere Python 3 is available.
 Output:
     stdout: triage lines (default), grouped lines (--by-channel), channel
             counts (--channels), full records (--ids), helper output
-            (--entity-candidates / --urgent-top / --theme-key), or a UTC line
+            (--retired-since / --landscape-survivors / --archive /
+            --entity-candidates / --urgent-top / --theme-key), or a UTC line
             (--now).
     stderr: errors (missing file, corrupt JSON, unknown ID). Exits non-zero.
+            --archive is the exception: a skipped-malformed-line count is a
+            warning, not an error, and still exits 0.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,7 +130,10 @@ from pathlib import Path
 # prints it so the skill can read/write the landscape in the same place.
 STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
 STATE_PATH = STATE_DIR / "marlin_state.json"
+LANDSCAPE_PATH = STATE_DIR / "marlin_landscape.json"
+ARCHIVE_DIR = STATE_DIR / "marlin_archive"
 URGENT_TOP_DEFAULT = 5
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _iso_now() -> str:
@@ -227,21 +276,31 @@ def normalize_entity_key(name: str) -> str:
 
 
 def _parse_argv(argv: list[str]) -> dict[str, object]:
-    """Parse flags. Value flags: --ids, --channel, --since-seq, --theme-key
+    """Parse flags. Value flags: --ids, --channel, --since-seq, --theme-key,
+    --retired-since, --entity, --signal-type, --since, --until, --themes
     (also `--flag=value`). Optional-value flag: --urgent-top (an int may
     follow; defaults otherwise). Boolean flags: --channels, --by-channel,
-    --entity-candidates, --now. Unknown args ignored for forward compat."""
+    --entity-candidates, --landscape-survivors, --archive, --now. Unknown
+    args ignored for forward compat."""
     out: dict[str, object] = {}
     value_flags = {
         "--ids": "ids",
         "--channel": "channel",
         "--since-seq": "since_seq",
         "--theme-key": "theme_key",
+        "--retired-since": "retired_since",
+        "--entity": "entity",
+        "--signal-type": "signal_type",
+        "--since": "since",
+        "--until": "until",
+        "--themes": "themes",
     }
     bool_flags = {
         "--channels": "channels",
         "--by-channel": "by_channel",
         "--entity-candidates": "entity_candidates",
+        "--landscape-survivors": "landscape_survivors",
+        "--archive": "archive",
         "--now": "now",
         "--state-dir": "state_dir",
     }
@@ -283,6 +342,20 @@ def _load_state() -> dict:
         _die(f"could not read {STATE_PATH}: {e}")
 
 
+def _load_landscape() -> dict:
+    if not LANDSCAPE_PATH.exists():
+        _die(
+            f"{LANDSCAPE_PATH} not found; run the landscape-synthesis step first"
+        )
+    try:
+        return json.loads(LANDSCAPE_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        _die(
+            f"could not read {LANDSCAPE_PATH}; run the landscape-synthesis "
+            f"step first: {e}"
+        )
+
+
 def _print_ids(signals: list[dict], raw_ids: str) -> None:
     wanted = [sid.strip() for sid in raw_ids.split(",") if sid.strip()]
     if not wanted:
@@ -322,6 +395,141 @@ def _print_theme_key(signals: list[dict], raw_ids: str) -> None:
     )
 
 
+def _print_retired_since(all_signals: list[dict], threshold: int) -> None:
+    """List retired signals after threshold with their recorded successor."""
+    by_id = {s.get("id"): s for s in all_signals}
+    retired = [
+        s
+        for s in all_signals
+        if s.get("status", "active") != "active"
+        and s.get("updated_seq", 0) > threshold
+    ]
+    for s in _newest_first(retired):
+        sid = s.get("id", "?")
+        status = s.get("status", "?")
+        channel = s.get("channel", "?")
+        title = (s.get("title") or "").strip()
+        print(f"seq:{s.get('updated_seq', '?')} | {sid} | retired:{status} | {channel} | {title}")
+        successor_id = s.get("superseded_by")
+        if not successor_id:
+            print("  superseded_by: <none recorded>")
+        elif successor_id in by_id:
+            successor_title = (by_id[successor_id].get("title") or "").strip()
+            print(f"  superseded_by: {successor_id} | {successor_title}")
+        else:
+            print(f"  superseded_by: {successor_id} (not in local window)")
+
+
+def _print_landscape_survivors(all_signals: list[dict]) -> None:
+    """Classify every landscape-referenced signal against the full state."""
+    landscape = _load_landscape()
+    referenced_ids: set[str] = set()
+    channels = landscape.get("channels") or {}
+    for channel_data in channels.values():
+        for theme in channel_data.get("active_themes") or []:
+            referenced_ids.update(theme.get("signal_ids") or [])
+        for urgent in channel_data.get("urgent_signals") or []:
+            signal_id = urgent.get("id")
+            if signal_id:
+                referenced_ids.add(signal_id)
+        for entity in channel_data.get("entities_to_watch") or []:
+            referenced_ids.update(entity.get("signal_ids") or [])
+    cross_channel = landscape.get("cross_channel") or {}
+    for event in cross_channel.get("linked_events") or []:
+        referenced_ids.update(event.get("signal_ids") or [])
+
+    by_id = {s.get("id"): s for s in all_signals}
+    survived = [by_id[sid] for sid in referenced_ids if sid in by_id and _is_active(by_id[sid])]
+    retired = [by_id[sid] for sid in referenced_ids if sid in by_id and not _is_active(by_id[sid])]
+    trimmed = sorted(sid for sid in referenced_ids if sid not in by_id)
+
+    sections = [("survived", survived), ("retired", retired), ("trimmed", trimmed)]
+    for i, (name, items) in enumerate(sections):
+        if i:
+            print()
+        print(f"## {name} ({len(items)})")
+        if name == "survived":
+            for s in _newest_first(items):
+                print(_format_signal(s))
+        elif name == "retired":
+            for s in _newest_first(items):
+                successor_id = s.get("superseded_by") or "-"
+                title = (s.get("title") or "").strip()
+                print(
+                    f"{s.get('id', '?')} | retired:{s.get('status', '?')} | "
+                    f"superseded_by:{successor_id} | {title}"
+                )
+        else:
+            for signal_id in items:
+                print(signal_id)
+
+
+def _validate_date(flag: str, value: str) -> str:
+    if not _DATE_RE.match(value):
+        _die(f"{flag} requires YYYY-MM-DD, got {value!r}")
+    return value
+
+
+def _load_archive() -> tuple[list[dict], int]:
+    """Read every marlin_archive/*.jsonl file, de-duplicated by id.
+
+    Returns (signals, skipped_count). Keeps, per id, the entry with the
+    newest `archived_at` — a retried sync can append the same signal twice.
+    Missing/empty archive dir returns ([], 0), not an error.
+    """
+    if not ARCHIVE_DIR.is_dir():
+        return [], 0
+    by_id: dict[str, dict] = {}
+    skipped = 0
+    for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            sid = entry.get("id")
+            if not sid:
+                skipped += 1
+                continue
+            existing = by_id.get(sid)
+            if existing is None or entry.get("archived_at", "") > existing.get("archived_at", ""):
+                by_id[sid] = entry
+    return list(by_id.values()), skipped
+
+
+def _print_archive(signals: list[dict]) -> None:
+    """archived:<YYYY-MM-DD> | <triage line>, sorted archived_at desc then
+    updated_seq desc."""
+    ordered = sorted(
+        signals,
+        key=lambda s: (s.get("archived_at", ""), s.get("updated_seq", 0)),
+        reverse=True,
+    )
+    for s in ordered:
+        date = (s.get("archived_at") or "")[:10]
+        print(f"archived:{date} | {_format_signal(s)}")
+
+
+def _qualifying_entities(chan_signals: list[dict]) -> dict[str, list[str]]:
+    """Entities appearing in ≥2 of chan_signals, verbatim from entity_tags,
+    mapped to their supporting signal IDs. chan_signals is expected to
+    already be scoped to one channel."""
+    ids_by_entity: dict[str, list[str]] = {}
+    for s in chan_signals:
+        sid = s.get("id", "?")
+        # de-dup entity per signal so one signal can't count twice
+        for ent in dict.fromkeys(s.get("entity_tags") or []):
+            ids_by_entity.setdefault(ent, []).append(sid)
+    return {e: ids for e, ids in ids_by_entity.items() if len(ids) >= 2}
+
+
 def _print_entity_candidates(signals: list[dict]) -> None:
     """Per channel: entities in ≥2 of the channel's signals, verbatim from
     entity_tags, with supporting signal IDs. Sorted by count desc, name asc."""
@@ -330,16 +538,32 @@ def _print_entity_candidates(signals: list[dict]) -> None:
             print()
         print(f"## {cid}")
         chan_signals = [s for s in signals if s.get("channel", "?") == cid]
-        ids_by_entity: dict[str, list[str]] = {}
-        for s in chan_signals:
-            sid = s.get("id", "?")
-            # de-dup entity per signal so one signal can't count twice
-            for ent in dict.fromkeys(s.get("entity_tags") or []):
-                ids_by_entity.setdefault(ent, []).append(sid)
-        qualifying = {e: ids for e, ids in ids_by_entity.items() if len(ids) >= 2}
+        qualifying = _qualifying_entities(chan_signals)
         for ent in sorted(qualifying, key=lambda e: (-len(qualifying[e]), e)):
             ids = qualifying[ent]
             print(f"{ent}\t{len(ids)}\t{','.join(ids)}")
+
+
+def _print_entity_candidates_final(chan_signals: list[dict], themes_blob: str) -> None:
+    """The final paste-ready entities_to_watch JSON array for ONE channel
+    (S12): qualifying entities (≥2 signals, same rule as
+    _qualifying_entities) minus those named in the channel's theme blob —
+    `ent.lower()` as a substring of `themes_blob.lower()`, matching
+    validate.py's theme_blob check exactly. Sorted count desc then entity
+    name asc; each entry's signal_ids sorted by updated_seq descending."""
+    qualifying = _qualifying_entities(chan_signals)
+    blob = themes_blob.lower()
+    by_id = {s.get("id"): s for s in chan_signals}
+    result = []
+    for ent in sorted(qualifying, key=lambda e: (-len(qualifying[e]), e)):
+        if ent.lower() in blob:
+            continue
+        ids = qualifying[ent]
+        sorted_ids = sorted(
+            ids, key=lambda sid: by_id[sid].get("updated_seq", 0), reverse=True
+        )
+        result.append({"entity": ent, "signal_ids": sorted_ids})
+    print(json.dumps(result, indent=2))
 
 
 def _print_urgent_top(signals: list[dict], n: int) -> None:
@@ -393,6 +617,51 @@ def main() -> None:
         _print_theme_key(all_signals, str(args["theme_key"]))
         return
 
+    # --retired-since intentionally operates on the full state: retired
+    # signals are excluded from every ordinary triage/landscape view below.
+    if "retired_since" in args:
+        try:
+            threshold = int(str(args["retired_since"]))
+        except ValueError:
+            _die(f"--retired-since requires an integer, got {args['retired_since']!r}")
+        candidates = all_signals
+        if "channel" in args:
+            candidates = [s for s in candidates if s.get("channel") == args["channel"]]
+        _print_retired_since(candidates, threshold)
+        return
+
+    # The landscape itself is channel-keyed, so this reports whole-window
+    # survivorship rather than applying --channel / --since-seq filters.
+    if args.get("landscape_survivors"):
+        _print_landscape_survivors(all_signals)
+        return
+
+    # --archive reads a separate on-disk log (everything ever evicted from the
+    # rolling window), not marlin_state.json — it doesn't touch all_signals.
+    if args.get("archive"):
+        archived, skipped = _load_archive()
+        if "channel" in args:
+            archived = [s for s in archived if s.get("channel") == args["channel"]]
+        if "entity" in args:
+            needle = str(args["entity"]).lower()
+            archived = [
+                s
+                for s in archived
+                if any(needle in (e or "").lower() for e in (s.get("entity_tags") or []))
+            ]
+        if "signal_type" in args:
+            archived = [s for s in archived if s.get("signal_type") == args["signal_type"]]
+        if "since" in args:
+            since = _validate_date("--since", str(args["since"]))
+            archived = [s for s in archived if (s.get("archived_at") or "")[:10] >= since]
+        if "until" in args:
+            until = _validate_date("--until", str(args["until"]))
+            archived = [s for s in archived if (s.get("archived_at") or "")[:10] <= until]
+        _print_archive(archived)
+        if skipped:
+            print(f"warning: skipped {skipped} malformed archive line(s)", file=sys.stderr)
+        return
+
     signals = [s for s in all_signals if _is_active(s)]
 
     # --channels: enumerate channels in the active state (ignores --channel filter).
@@ -414,7 +683,16 @@ def main() -> None:
         signals = [s for s in signals if s.get("updated_seq", 0) > threshold]
 
     if args.get("entity_candidates"):
-        _print_entity_candidates(signals)
+        if "themes" in args:
+            if "channel" not in args:
+                _die(
+                    "--entity-candidates --themes emits the final "
+                    "entities_to_watch set, which is per-channel; pass "
+                    "--channel <id>"
+                )
+            _print_entity_candidates_final(signals, str(args["themes"]))
+        else:
+            _print_entity_candidates(signals)
         return
 
     if "urgent_top" in args:

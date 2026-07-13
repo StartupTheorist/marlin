@@ -22,7 +22,8 @@ Checks:
     then signal_ids count desc, then max updated_seq desc).
   * entities_to_watch — each entity appears in ≥2 of the channel's signals,
     verbatim from `entity_tags`, and is not named in any of the channel's
-    theme strings; listed signal_ids actually carry the entity.
+    theme strings; listed signal_ids actually carry the entity; and the set
+    is complete: every qualifying entity is listed (S12).
   * urgent_signals — ≤5 per channel; sorted importance desc / updated_seq desc;
     every referenced signal is handling=urgent in state.
   * top-level — `as_of` is ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`; `updated_through_seq`
@@ -205,6 +206,25 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict]) -> list[s
             v.append(
                 f"[{cid}] entity {ent!r} is named in a theme string; "
                 "entities_to_watch excludes theme subjects"
+            )
+
+    # --- entities_to_watch: completeness (S12) — every qualifying entity
+    # (≥2 signals, not a theme subject) must be listed, not just the listed
+    # ones sound. Recomputes the same qualifying set inspect.py's
+    # --entity-candidates emits.
+    listed_entities = {e.get("entity", "") for e in section.get("entities_to_watch") or []}
+    ids_by_entity: dict[str, list[str]] = {}
+    for s in chan_signals:
+        for ent in dict.fromkeys(s.get("entity_tags") or []):
+            ids_by_entity.setdefault(ent, []).append(s.get("id"))
+    for ent, sids in ids_by_entity.items():
+        if len(sids) < 2 or ent.lower() in theme_blob:
+            continue
+        if ent not in listed_entities:
+            v.append(
+                f"[{cid}] entity {ent!r} qualifies for entities_to_watch "
+                f"({len(sids)} signals, not a theme subject) but is missing "
+                "— the set must be complete (S12)"
             )
 
     # --- urgent_signals: cap, sort, handling source ---

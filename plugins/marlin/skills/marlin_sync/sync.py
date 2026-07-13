@@ -4,8 +4,9 @@
 Fetches new signals from the Marlin REST API, merges into marlin_state.json
 in a stable state directory (MARLIN_STATE_DIR, default ~/.marlin/ — NOT the
 cwd, so diff-mode survives scheduled runs launched from anywhere), trims to a
-rolling window, and prints a one-line summary. Designed to be invoked by the
-marlin-sync skill so that
+rolling window — archiving any evicted signals first so trimming is never
+outright deletion — and prints a one-line summary. Designed to be invoked by
+the marlin-sync skill so that
 the mechanical steps (fetch, page, merge, trim, write) run outside the LLM
 loop and don't pay token cost proportional to payload size.
 
@@ -24,9 +25,19 @@ When a grant is supplied the script hits /sync/signals; when a static token
 is supplied it hits /signals. If both are supplied, grant mode wins and a
 warning goes to stderr.
 
+State files (written in MARLIN_STATE_DIR):
+    marlin_state.json              The rolling window (newest WINDOW signals).
+    marlin_archive/<YYYY-MM>.jsonl Signals evicted from the window on trim,
+                                     one JSON line each (full signal record
+                                     plus an added archived_at), appended
+                                     monthly — never rewritten. Read this back
+                                     with inspect.py --archive.
+
 Output:
     stdout: one line, e.g.
         synced 12 new signals, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
+    or, when the trim evicted signals from the window this run:
+        synced 12 new signals, archived 4, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
     stderr: errors (auth, unreachable, corrupt state). Exits non-zero.
 """
 
@@ -48,7 +59,8 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
 STATE_PATH = STATE_DIR / "marlin_state.json"
 BACKUP_PATH = STATE_DIR / "marlin_state.json.bak"
-WINDOW = 100
+ARCHIVE_DIR = STATE_DIR / "marlin_archive"
+WINDOW = int(os.environ.get("MARLIN_WINDOW") or 100)
 PAGE_LIMIT = 100
 MAX_PAGES = 50
 TIMEOUT_SECONDS = 30
@@ -144,6 +156,26 @@ def _load_state() -> tuple[dict, bool]:
         return {"version": 1, "signals": []}, True
 
 
+def _archive_evicted(evicted: list[dict], archived_at: str) -> None:
+    """Append evicted signals to the current month's archive file.
+
+    Must run before the trimmed state is written — a signal must never be
+    deleted from state without first being archived. Raises via _die (never
+    returns) on any OSError, so the caller's subsequent state write never runs.
+    """
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    archive_path = ARCHIVE_DIR / f"{month}.jsonl"
+    try:
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        with archive_path.open("a") as f:
+            for s in evicted:
+                entry = dict(s)
+                entry["archived_at"] = archived_at
+                f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        _die(f"could not archive evicted signals ({archive_path}): {e}")
+
+
 def main() -> None:
     argv = _parse_argv(sys.argv[1:])
 
@@ -223,11 +255,16 @@ def main() -> None:
         )
         return
 
-    trimmed = sorted(
+    all_sorted = sorted(
         signals_by_id.values(),
         key=lambda s: s.get("updated_seq", 0),
         reverse=True,
-    )[:WINDOW]
+    )
+    trimmed = all_sorted[:WINDOW]
+    evicted = all_sorted[WINDOW:]
+
+    if evicted:
+        _archive_evicted(evicted, now)  # before the state write — never delete un-archived
 
     new_state = {
         "version": 1,
@@ -237,8 +274,9 @@ def main() -> None:
         "signals": trimmed,
     }
     STATE_PATH.write_text(json.dumps(new_state, indent=2))
+    archived_segment = f", archived {len(evicted)}" if evicted else ""
     print(
-        f"{prefix}synced {new_count} new signals, "
+        f"{prefix}synced {new_count} new signals{archived_segment}, "
         f"cursor={next_cursor}, last_new_signal_at={now}"
     )
 
