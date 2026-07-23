@@ -38,6 +38,8 @@ Output:
         synced 12 new signals, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
     or, when the trim evicted signals from the window this run:
         synced 12 new signals, archived 4, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
+    or, when the per-channel floor changed the retained set:
+        synced 12 new signals, archived 4, floor protected 3, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
     stderr: errors (auth, unreachable, corrupt state). Exits non-zero.
 """
 
@@ -49,6 +51,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,6 +64,7 @@ STATE_PATH = STATE_DIR / "marlin_state.json"
 BACKUP_PATH = STATE_DIR / "marlin_state.json.bak"
 ARCHIVE_DIR = STATE_DIR / "marlin_archive"
 WINDOW = int(os.environ.get("MARLIN_WINDOW") or 100)
+FLOOR = int(os.environ.get("MARLIN_CHANNEL_FLOOR") or 10)
 PAGE_LIMIT = 100
 MAX_PAGES = 50
 TIMEOUT_SECONDS = 30
@@ -176,6 +180,48 @@ def _archive_evicted(evicted: list[dict], archived_at: str) -> None:
         _die(f"could not archive evicted signals ({archive_path}): {e}")
 
 
+def _floored_trim(
+    signals: Iterable[dict], window: int, floor: int
+) -> tuple[list[dict], list[dict], int]:
+    """Keep a newest-first window while reserving active slots per channel."""
+    ordered = sorted(
+        signals,
+        key=lambda s: (s.get("updated_seq", 0), s.get("id", "")),
+        reverse=True,
+    )
+    if len(ordered) <= window:
+        return ordered, [], 0
+
+    channels: dict[object, list[dict]] = {}
+    for signal in ordered:
+        if signal.get("status", "active") != "active":
+            continue
+        channels.setdefault(signal.get("channel"), []).append(signal)
+
+    num_channels = max(1, len({signal.get("channel") for signal in ordered}))
+    effective_floor = min(floor, window // num_channels)
+    protected_ids: set[object] = set()
+    for channel_signals in channels.values():
+        protected_ids.update(
+            signal.get("id") for signal in channel_signals[:effective_floor]
+        )
+
+    protected = [signal for signal in ordered if signal.get("id") in protected_ids]
+    unprotected = [signal for signal in ordered if signal.get("id") not in protected_ids]
+    kept = sorted(
+        protected + unprotected[: window - len(protected)],
+        key=lambda s: (s.get("updated_seq", 0), s.get("id", "")),
+        reverse=True,
+    )
+    kept_ids = {signal.get("id") for signal in kept}
+    evicted = [signal for signal in ordered if signal.get("id") not in kept_ids]
+    plain_kept_ids = {signal.get("id") for signal in ordered[:window]}
+    floor_protected_count = sum(
+        signal.get("id") not in plain_kept_ids for signal in kept
+    )
+    return kept, evicted, floor_protected_count
+
+
 def main() -> None:
     argv = _parse_argv(sys.argv[1:])
 
@@ -255,13 +301,9 @@ def main() -> None:
         )
         return
 
-    all_sorted = sorted(
-        signals_by_id.values(),
-        key=lambda s: s.get("updated_seq", 0),
-        reverse=True,
+    trimmed, evicted, floor_protected = _floored_trim(
+        signals_by_id.values(), WINDOW, FLOOR
     )
-    trimmed = all_sorted[:WINDOW]
-    evicted = all_sorted[WINDOW:]
 
     if evicted:
         _archive_evicted(evicted, now)  # before the state write — never delete un-archived
@@ -275,8 +317,9 @@ def main() -> None:
     }
     STATE_PATH.write_text(json.dumps(new_state, indent=2))
     archived_segment = f", archived {len(evicted)}" if evicted else ""
+    floor_segment = f", floor protected {floor_protected}" if floor_protected else ""
     print(
-        f"{prefix}synced {new_count} new signals{archived_segment}, "
+        f"{prefix}synced {new_count} new signals{archived_segment}{floor_segment}, "
         f"cursor={next_cursor}, last_new_signal_at={now}"
     )
 

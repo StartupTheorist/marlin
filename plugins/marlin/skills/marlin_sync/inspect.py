@@ -86,13 +86,33 @@ skill's rules require, so the agent doesn't do it by hand):
                             --until <YYYY-MM-DD>   Keep archived_at[:10] <= this.
                           --entity/--signal-type/--since/--until are ignored
                           outside --archive mode.
+    --deadlines           The deadline radar (S8). Read mode over BOTH state and
+                          the archive — the first inspect mode to read both —
+                          keyed on the explicit `deadline_at` field (never
+                          `event_time`). Lists every **active** signal whose
+                          `deadline_at` parses to a date in `[now − 7d,
+                          now + horizon]`, deduplicated by id across the two
+                          sources (state wins), sorted by deadline date
+                          ascending. Each line is
+                          `<when> | <origin> | <standard index line>`, where
+                          `<when>` is `due in <n>d` / `due today` /
+                          `PASSED <n>d ago` and `<origin>` is `in-window`
+                          (state) or `archived`. Superseded/moved/cancelled
+                          deadlines never appear (status must be active in both
+                          sources); a null `deadline_at` never qualifies. The
+                          archive scan is bounded to the current + prior month's
+                          files. Composes with:
+                            --horizon <days>      Forward window in days
+                                                   (default 21). The just-passed
+                                                   tail is fixed at 7 days.
     --now                 Print the current UTC time as ISO-8601 seconds with a
                           trailing Z (`YYYY-MM-DDTHH:MM:SSZ`), for the
                           landscape's `as_of`. Needs no state file.
 
 Precedence: --now > --ids > --channels > --theme-key > --retired-since >
---landscape-survivors > --archive > --entity-candidates > --urgent-top >
---by-channel/default (the latter honoring --channel and --since-seq).
+--landscape-survivors > --archive > --deadlines > --entity-candidates >
+--urgent-top > --by-channel/default (the latter honoring --channel and
+--since-seq).
 
 Note on `seq` gaps: `updated_seq` is a single global monotonic counter on the
 server (MAX+1, reassigned on every insert AND update), so numbers are routinely
@@ -108,7 +128,7 @@ Stdlib only so it works anywhere Python 3 is available.
 Output:
     stdout: triage lines (default), grouped lines (--by-channel), channel
             counts (--channels), full records (--ids), helper output
-            (--retired-since / --landscape-survivors / --archive /
+            (--retired-since / --landscape-survivors / --archive / --deadlines /
             --entity-candidates / --urgent-top / --theme-key), or a UTC line
             (--now).
     stderr: errors (missing file, corrupt JSON, unknown ID). Exits non-zero.
@@ -122,7 +142,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 # Resolve the state directory the same way sync.py does (MARLIN_STATE_DIR, else
@@ -277,11 +297,11 @@ def normalize_entity_key(name: str) -> str:
 
 def _parse_argv(argv: list[str]) -> dict[str, object]:
     """Parse flags. Value flags: --ids, --channel, --since-seq, --theme-key,
-    --retired-since, --entity, --signal-type, --since, --until, --themes
-    (also `--flag=value`). Optional-value flag: --urgent-top (an int may
-    follow; defaults otherwise). Boolean flags: --channels, --by-channel,
-    --entity-candidates, --landscape-survivors, --archive, --now. Unknown
-    args ignored for forward compat."""
+    --retired-since, --entity, --signal-type, --since, --until, --themes,
+    --horizon (also `--flag=value`). Optional-value flag: --urgent-top (an int
+    may follow; defaults otherwise). Boolean flags: --channels, --by-channel,
+    --entity-candidates, --landscape-survivors, --archive, --deadlines, --now.
+    Unknown args ignored for forward compat."""
     out: dict[str, object] = {}
     value_flags = {
         "--ids": "ids",
@@ -294,6 +314,7 @@ def _parse_argv(argv: list[str]) -> dict[str, object]:
         "--since": "since",
         "--until": "until",
         "--themes": "themes",
+        "--horizon": "horizon",
     }
     bool_flags = {
         "--channels": "channels",
@@ -301,6 +322,7 @@ def _parse_argv(argv: list[str]) -> dict[str, object]:
         "--entity-candidates": "entity_candidates",
         "--landscape-survivors": "landscape_survivors",
         "--archive": "archive",
+        "--deadlines": "deadlines",
         "--now": "now",
         "--state-dir": "state_dir",
     }
@@ -470,18 +492,25 @@ def _validate_date(flag: str, value: str) -> str:
     return value
 
 
-def _load_archive() -> tuple[list[dict], int]:
-    """Read every marlin_archive/*.jsonl file, de-duplicated by id.
+def _load_archive(only_months: set[str] | None = None) -> tuple[list[dict], int]:
+    """Read marlin_archive/*.jsonl files, de-duplicated by id.
 
     Returns (signals, skipped_count). Keeps, per id, the entry with the
     newest `archived_at` — a retried sync can append the same signal twice.
     Missing/empty archive dir returns ([], 0), not an error.
+
+    `only_months` (a set of `YYYY-MM` file stems) bounds the scan to those
+    monthly files — the deadline radar passes the recent months so it never
+    walks a multi-year archive (scoping decision 3). None reads every file
+    (the default `--archive` behavior).
     """
     if not ARCHIVE_DIR.is_dir():
         return [], 0
     by_id: dict[str, dict] = {}
     skipped = 0
     for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
+        if only_months is not None and path.stem not in only_months:
+            continue
         try:
             lines = path.read_text().splitlines()
         except OSError:
@@ -515,6 +544,135 @@ def _print_archive(signals: list[dict]) -> None:
     for s in ordered:
         date = (s.get("archived_at") or "")[:10]
         print(f"archived:{date} | {_format_signal(s)}")
+
+
+def _parse_deadline_date(value: object) -> date | None:
+    """Parse a `deadline_at` value to a calendar date, or None.
+
+    Tolerant of the two shapes the extractor emits: a bare `YYYY-MM-DD` or a
+    full ISO-8601 datetime (with a trailing `Z` or an explicit offset). Anything
+    unparseable — including null, empty, or a non-string — returns None, so a
+    signal with no usable deadline simply never reaches the radar. Comparison is
+    on the date component only, since the radar's horizon is measured in days.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if _DATE_RE.match(text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        head = text[:10]
+        if _DATE_RE.match(head):
+            try:
+                return date.fromisoformat(head)
+            except ValueError:
+                return None
+        return None
+
+
+def _recent_archive_months(now: datetime) -> set[str]:
+    """The current and prior month as `YYYY-MM` file stems.
+
+    Bounds the radar's archive scan (scoping decision 3): a near-future deadline
+    was, in the common case, evicted recently, so scanning the current + prior
+    month's archive files covers it without walking the whole archive. The
+    horizon filter in `_deadline_radar` is the real bound; this only limits I/O.
+    """
+    cur = now.strftime("%Y-%m")
+    if now.month == 1:
+        prior = f"{now.year - 1:04d}-12"
+    else:
+        prior = f"{now.year:04d}-{now.month - 1:02d}"
+    return {cur, prior}
+
+
+# The just-passed tail: a deadline up to this many days in the past still shows
+# on the radar, so a date that slipped by is visible rather than silently gone.
+DEADLINE_TAIL_DAYS = 7
+
+
+def _deadline_radar(
+    state_signals: list[dict],
+    archive_signals: list[dict],
+    now: datetime,
+    horizon: int,
+) -> list[dict]:
+    """The deadline radar: active signals whose `deadline_at` lands in
+    `[now − 7d, now + horizon]`, keyed on the explicit `deadline_at` field
+    (never `event_time`).
+
+    Reads both the rolling window (`state_signals`, the full state including
+    retired records) and the archive (`archive_signals`), so a deadline-bearing
+    signal already evicted from the window still surfaces. Rules:
+
+    - **Active only** (design decision 6): a signal counts only when its
+      `status` is `"active"`, applied to both sources — a superseded, moved, or
+      cancelled deadline is never resurfaced.
+    - **State wins** on id: if an id is present in state at all, its archive
+      copy is ignored entirely. State carries the current status and deadline;
+      the archive holds a snapshot from eviction time. This is also what stops a
+      signal superseded *in state* from being revived by a stale still-active
+      archive snapshot.
+    - **Null / unparseable `deadline_at` never qualifies.**
+
+    Returns annotated records `{signal, origin, days_until, deadline_date}`,
+    sorted by deadline date ascending (ties: newest `updated_seq` first, then
+    id), where `origin` is `"in-window"` or `"archived"`.
+    """
+    now_date = now.date()
+    state_ids = {s.get("id") for s in state_signals}
+    records: list[dict] = []
+
+    def consider(s: dict, origin: str) -> None:
+        if s.get("status", "active") != "active":
+            return
+        deadline_date = _parse_deadline_date(s.get("deadline_at"))
+        if deadline_date is None:
+            return
+        days_until = (deadline_date - now_date).days
+        if not (-DEADLINE_TAIL_DAYS <= days_until <= horizon):
+            return
+        records.append(
+            {
+                "signal": s,
+                "origin": origin,
+                "days_until": days_until,
+                "deadline_date": deadline_date,
+            }
+        )
+
+    for s in state_signals:
+        consider(s, "in-window")
+    for s in archive_signals:
+        if s.get("id") in state_ids:
+            continue  # state wins — the archive snapshot is never consulted
+        consider(s, "archived")
+
+    records.sort(
+        key=lambda r: (
+            r["deadline_date"],
+            -r["signal"].get("updated_seq", 0),
+            str(r["signal"].get("id", "")),
+        )
+    )
+    return records
+
+
+def _format_deadline_line(record: dict) -> str:
+    """`<when> | <origin> | <standard index line>` for one radar hit."""
+    days = record["days_until"]
+    if days > 0:
+        when = f"due in {days}d"
+    elif days == 0:
+        when = "due today"
+    else:
+        when = f"PASSED {-days}d ago"
+    return f"{when} | {record['origin']} | {_format_signal(record['signal'])}"
 
 
 def _qualifying_entities(chan_signals: list[dict]) -> dict[str, list[str]]:
@@ -658,6 +816,25 @@ def main() -> None:
             until = _validate_date("--until", str(args["until"]))
             archived = [s for s in archived if (s.get("archived_at") or "")[:10] <= until]
         _print_archive(archived)
+        if skipped:
+            print(f"warning: skipped {skipped} malformed archive line(s)", file=sys.stderr)
+        return
+
+    # --deadlines reads state AND archive (the first inspect mode to read both),
+    # keyed on the explicit deadline_at field. all_signals is the full state
+    # (incl. retired) on purpose: the radar filters active internally, and a
+    # retired-in-state id must still block its stale archive snapshot.
+    if args.get("deadlines"):
+        horizon = 21
+        if "horizon" in args:
+            try:
+                horizon = int(str(args["horizon"]))
+            except ValueError:
+                _die(f"--horizon requires an integer, got {args['horizon']!r}")
+        now = datetime.now(timezone.utc)
+        archived, skipped = _load_archive(only_months=_recent_archive_months(now))
+        for record in _deadline_radar(all_signals, archived, now, horizon):
+            print(_format_deadline_line(record))
         if skipped:
             print(f"warning: skipped {skipped} malformed archive line(s)", file=sys.stderr)
         return
