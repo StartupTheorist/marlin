@@ -52,10 +52,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from params import CHANNEL_FLOOR, WINDOW_SIZE
+from params import CHANNEL_FLOOR, FLOOR_LIVENESS_DAYS, WINDOW_SIZE
 
 # State lives in a stable directory, not the cwd, so a scheduled run launched
 # from an arbitrary/ephemeral working dir still finds prior state (otherwise it
@@ -182,10 +182,41 @@ def _archive_evicted(evicted: list[dict], archived_at: str) -> None:
         _die(f"could not archive evicted signals ({archive_path}): {e}")
 
 
+def _created_at(signal: dict) -> datetime | None:
+    """Parse a signal's server-side creation time, or None when unusable.
+
+    `created_at` is deliberate: `event_time` can be future-dated by the
+    extractor (I18), and a future-dated event would keep a dead channel
+    protected forever — the exact failure this gate exists to end.
+    """
+    value = signal.get("created_at")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _channel_is_live(channel_signals: list[dict], cutoff: datetime) -> bool:
+    """Return whether a channel still earns floor protection.
+
+    I17: without this gate the floor pins a paused channel's newest 10 signals
+    forever, and every later sync evicts live signals to keep protecting dead
+    ones. A channel is live when its newest signal was created on or after the
+    cutoff. When no signal in the channel carries a usable creation time the
+    channel counts as live — the floor exists to prevent loss, so an unknown
+    clock must never silently withdraw protection.
+    """
+    times = [value for value in (_created_at(signal) for signal in channel_signals) if value is not None]
+    return not times or max(times) >= cutoff
+
+
 def _floored_trim(
-    signals: Iterable[dict], window: int, floor: int
+    signals: Iterable[dict], window: int, floor: int, now: datetime | None = None
 ) -> tuple[list[dict], list[dict], int]:
-    """Keep a newest-first window while reserving active slots per channel."""
+    """Keep a newest-first window while reserving active slots per live channel."""
     ordered = sorted(
         signals,
         key=lambda s: (s.get("updated_seq", 0), s.get("id", "")),
@@ -200,10 +231,14 @@ def _floored_trim(
             continue
         channels.setdefault(signal.get("channel"), []).append(signal)
 
-    num_channels = max(1, len({signal.get("channel") for signal in ordered}))
-    effective_floor = min(floor, window // num_channels)
+    # A dead channel neither receives protection nor dilutes anyone else's: it
+    # leaves the denominator too. Otherwise twenty paused channels would shrink a
+    # live quiet channel's floor toward zero (I17's second-order effect).
+    cutoff = (now or datetime.now(timezone.utc)).astimezone(timezone.utc) - timedelta(days=FLOOR_LIVENESS_DAYS)
+    live = [signals for signals in channels.values() if _channel_is_live(signals, cutoff)]
+    effective_floor = min(floor, window // max(1, len(live)))
     protected_ids: set[object] = set()
-    for channel_signals in channels.values():
+    for channel_signals in live:
         protected_ids.update(
             signal.get("id") for signal in channel_signals[:effective_floor]
         )

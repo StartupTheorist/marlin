@@ -101,10 +101,22 @@ skill's rules require, so the agent doesn't do it by hand):
                           deadlines never appear (status must be active in both
                           sources); a null `deadline_at` never qualifies. The
                           archive scan is bounded to the current + prior month's
-                          files. Composes with:
+                          files. Ack-aware (S13): a signal the user marked
+                          `handled` is hidden, and an `expired` signal's
+                          passed-deadline tail is printed on the first run after
+                          it expired and suppressed on every later run — without
+                          that, expiry itself re-nags for the whole tail window.
+                          A signal with a non-`open` state is tagged
+                          ` | ack:<state>` at the end of its line. Reading acks
+                          never writes them: the ack store's own transitions are
+                          persisted by assemble's write step, not here.
+                          Composes with:
                             --horizon <days>      Forward window in days
                                                    (default 21). The just-passed
                                                    tail is fixed at 7 days.
+                            --all                 Show every radar hit, including
+                                                   handled ones and already-shown
+                                                   expired tails.
     --now                 Print the current UTC time as ISO-8601 seconds with a
                           trailing Z (`YYYY-MM-DDTHH:MM:SSZ`), for the
                           landscape's `as_of`. Needs no state file.
@@ -301,8 +313,8 @@ def _parse_argv(argv: list[str]) -> dict[str, object]:
     --retired-since, --entity, --signal-type, --since, --until, --themes,
     --horizon (also `--flag=value`). Optional-value flag: --urgent-top (an int
     may follow; defaults otherwise). Boolean flags: --channels, --by-channel,
-    --entity-candidates, --landscape-survivors, --archive, --deadlines, --now.
-    Unknown args ignored for forward compat."""
+    --entity-candidates, --landscape-survivors, --archive, --deadlines, --all,
+    --now. Unknown args ignored for forward compat."""
     out: dict[str, object] = {}
     value_flags = {
         "--ids": "ids",
@@ -324,6 +336,7 @@ def _parse_argv(argv: list[str]) -> dict[str, object]:
         "--landscape-survivors": "landscape_survivors",
         "--archive": "archive",
         "--deadlines": "deadlines",
+        "--all": "all",
         "--now": "now",
         "--state-dir": "state_dir",
     }
@@ -548,13 +561,20 @@ def _print_archive(signals: list[dict]) -> None:
 
 
 def _parse_deadline_date(value: object) -> date | None:
-    """Parse a `deadline_at` value to a calendar date, or None.
+    """Parse a `deadline_at` value to its UTC calendar date, or None.
 
     Tolerant of the two shapes the extractor emits: a bare `YYYY-MM-DD` or a
     full ISO-8601 datetime (with a trailing `Z` or an explicit offset). Anything
     unparseable — including null, empty, or a non-string — returns None, so a
     signal with no usable deadline simply never reaches the radar. Comparison is
     on the date component only, since the radar's horizon is measured in days.
+
+    I19: an offset-carrying timestamp is converted to UTC **before** its date is
+    taken, because every caller compares the result against a UTC calendar date.
+    Reading `2026-08-07T23:59:00-07:00` as Aug 7 dropped a still-future deadline
+    out of the mandatory-urgent band up to ~11 hours early. A naive timestamp is
+    assumed to be UTC already. This is the one shared date helper — `ack.py`
+    imports it rather than keeping a second copy of the same arithmetic.
     """
     if not isinstance(value, str) or not value.strip():
         return None
@@ -565,7 +585,10 @@ def _parse_deadline_date(value: object) -> date | None:
         except ValueError:
             return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed.date()
     except ValueError:
         head = text[:10]
         if _DATE_RE.match(head):
@@ -659,8 +682,8 @@ def _deadline_radar(
     return records
 
 
-def _format_deadline_line(record: dict) -> str:
-    """`<when> | <origin> | <standard index line>` for one radar hit."""
+def _format_deadline_line(record: dict, ack_status: str = "open") -> str:
+    """`<when> | <origin> | <standard index line>[ | ack:<state>]` for one hit."""
     days = record["days_until"]
     if days > 0:
         when = f"due in {days}d"
@@ -668,7 +691,27 @@ def _format_deadline_line(record: dict) -> str:
         when = "due today"
     else:
         when = f"PASSED {-days}d ago"
-    return f"{when} | {record['origin']} | {_format_signal(record['signal'])}"
+    line = f"{when} | {record['origin']} | {_format_signal(record['signal'])}"
+    return f"{line} | ack:{ack_status}" if ack_status != "open" else line
+
+
+def _radar_ack_view(state_signals: list[dict]) -> tuple[dict[str, str], set[str]]:
+    """Resolve ack state for the radar, read-only.
+
+    Imported lazily, and only here: `ack.py` imports this module for its archive
+    and date helpers, so a module-level import in the other direction would be a
+    cycle. Returns the effective status per signal id plus the ids whose expired
+    passed-tail an earlier run already showed. A missing or unreadable ack store
+    must never break the radar, so any store error degrades to "no acks".
+    """
+    try:
+        from ack import effective_statuses, expired_tail_already_shown, load_ack_store
+
+        store = load_ack_store(STATE_DIR)
+        statuses = effective_statuses(store, state_signals)
+        return statuses, expired_tail_already_shown(store, statuses, STATE_DIR)
+    except ValueError:
+        return {}, set()
 
 
 def _qualifying_entities(chan_signals: list[dict]) -> dict[str, list[str]]:
@@ -872,8 +915,18 @@ def main() -> None:
                 _die(f"--horizon requires an integer, got {args['horizon']!r}")
         now = datetime.now(timezone.utc)
         archived, skipped = _load_archive(only_months=_recent_archive_months(now))
+        show_all = bool(args.get("all"))
+        statuses, tail_shown = _radar_ack_view(all_signals)
         for record in _deadline_radar(all_signals, archived, now, horizon):
-            print(_format_deadline_line(record))
+            status = statuses.get(record["signal"].get("id"), "open")
+            if not show_all:
+                if status == "handled":
+                    continue
+                # Expiry announces itself once. After the ledger has recorded the
+                # transition, the remaining tail days would be pure re-nagging.
+                if status == "expired" and record["days_until"] < 0 and record["signal"].get("id") in tail_shown:
+                    continue
+            print(_format_deadline_line(record, status))
         if skipped:
             print(f"warning: skipped {skipped} malformed archive line(s)", file=sys.stderr)
         return

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """The assemble pipeline: mechanical landscape construction.
 
+--gate prints a cheap JSON verdict on whether time alone has made the written
+landscape wrong (pure, stdout, writes nothing) — run it on every poll, including
+the quiet ones where sync reports no new signals;
 --pre prints the LLM-facing working set (pure, stdout, writes nothing);
 --finish <draft> validates the membership draft and emits the ordered v3
 skeleton with named prose slots; --finish <draft> --prose <map> injects the
 prose and writes marlin_landscape.json. The model's entire output is the
 draft and the prose map — every structured write happens here, in code.
 The pure computation functions at the top are individually unit-tested.
+
+The finish step also applies the S13 ack rules, in a fixed order: suppress
+`handled`/`expired` from the action surfaces, then sort, then cap. Theme
+membership is never filtered by ack state.
 """
 
 from __future__ import annotations
@@ -17,8 +24,23 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from inspect import _deadline_radar, entities_to_watch, urgent_top
+from ack import (
+    annotate_ack_statuses,
+    effective_statuses,
+    expired_tail_already_shown,
+    load_ack_store,
+    pending_transitions,
+    persist_effective_transitions,
+)
+from inspect import (
+    _deadline_radar,
+    _load_archive,
+    _recent_archive_months,
+    entities_to_watch,
+    urgent_top,
+)
 from params import (
+    ACK_FINAL_NAG_DAYS,
     ARCHIVE_LOOKBACK_DAYS,
     CLUSTER_ARCHIVED_SAMPLE,
     CLUSTER_ENTITY_OVERLAP_MIN,
@@ -458,6 +480,46 @@ def deadline_hits(state_signals: list[dict], archive_signals: list[dict], now: d
     return _deadline_radar(state_signals, archive_signals, now, RADAR_HORIZON_DAYS)
 
 
+def deadline_archive(now: datetime) -> list[dict]:
+    """Read the archive coverage the DEADLINE radar contract requires.
+
+    Deliberately not `read_archive_slice`: that slice bounds by ULID *creation*
+    time (ARCHIVE_LOOKBACK_DAYS), which is right for birth clustering and wrong
+    for deadlines. A signal created 30 days ago, evicted today, and due in two
+    days is a live obligation, and bounding by creation age hid it from the
+    mandatory-urgent rule and from its own once-only expiry tail — while
+    `inspect.py --deadlines` showed it. This restores the radar's own bound
+    (current + prior month's files), so the two agree.
+    """
+    archived, _skipped = _load_archive(only_months=_recent_archive_months(now))
+    return archived
+
+
+def mandatory_deadline_records(radar: list[dict], ack_statuses: dict[str, str]) -> list[dict]:
+    """Return the radar hits the finish step forces into `urgent_signals`.
+
+    One rule, one implementation — `--finish` applies it and `--gate` asks
+    whether applying it would change anything.
+    """
+    selected: list[dict] = []
+    for record in radar:
+        status = ack_statuses.get(record["signal"].get("id"), "open")
+        # Forward band only: a just-passed deadline (the radar's tail) is
+        # awareness, not a mandatory urgent — the design's rule is "upcoming
+        # within the band", so bound below at 0.
+        if not (0 <= record["days_until"] <= MANDATORY_URGENT_DAYS):
+            continue
+        if status in ("handled", "expired"):
+            continue
+        # Final nag: an acknowledged obligation stops being forced urgent until
+        # it is imminent, then returns in every run's urgent list until it is
+        # handled or expires.
+        if status == "acknowledged" and record["days_until"] > ACK_FINAL_NAG_DAYS:
+            continue
+        selected.append(record)
+    return selected
+
+
 STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
 STATE_PATH = STATE_DIR / "marlin_state.json"
 LANDSCAPE_PATH = STATE_DIR / "marlin_landscape.json"
@@ -466,6 +528,20 @@ LANDSCAPE_PATH = STATE_DIR / "marlin_landscape.json"
 # (that collapses the delta baseline onto itself).
 PRIOR_BACKUP_PATH = STATE_DIR / "marlin_landscape.prior.json"
 ARCHIVE_DIR = STATE_DIR / "marlin_archive"
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON via a same-directory temp file + os.replace (crash-safe)."""
+    temp = path.with_name(path.name + f".tmp{os.getpid()}")
+    try:
+        with temp.open("w") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise ValueError(f"could not write {path}: {exc}") from exc
 
 
 def _load_json(path: Path, *, required: bool) -> dict | None:
@@ -503,11 +579,38 @@ def _grounded_entry(signal: dict) -> dict:
     return entry
 
 
+def _carried_with_titles(themes: list[dict], by_id: dict[str, dict]) -> list[dict]:
+    """Attach `{id, title}` members to carried themes (I22b).
+
+    Cluster candidates already ship titles, so judging a proposed birth is a
+    single read while judging a thin carried theme required a per-id drill.
+    `signal_ids` stays as the draftable list; `members` is the readable one.
+    """
+    return [
+        dict(
+            theme,
+            members=[
+                {"id": sid, "title": (by_id.get(sid) or {}).get("title")}
+                for sid in theme.get("signal_ids") or []
+            ],
+        )
+        for theme in themes
+    ]
+
+
 def build_pre(state: dict, prior: dict | None, now: datetime) -> dict:
     """Build the read-only, LLM-facing working set for the membership turn."""
-    all_state = list(state.get("signals") or [])
+    # Acks are annotations on the working set, never a filter in this stage.
+    # This read-only path deliberately does not persist a stale/expired result.
+    raw_state = list(state.get("signals") or [])
+    ack_store = load_ack_store()
+    radar_archive = deadline_archive(now)
+    ack_statuses = effective_statuses(ack_store, raw_state, now, radar_archive)
+    all_state = annotate_ack_statuses(raw_state, ack_statuses)
     active = _active(all_state)
     archive, skipped = read_archive_slice(ARCHIVE_DIR, now)
+    archive = annotate_ack_statuses(archive, ack_statuses)
+    radar_archive = annotate_ack_statuses(radar_archive, ack_statuses)
     carry = build_carryover(prior, all_state)
     prior_themes = carry["carryover"]
     lifecycle = compute_lifecycle(prior_themes, all_state + archive, now)
@@ -529,8 +632,16 @@ def build_pre(state: dict, prior: dict | None, now: datetime) -> dict:
     clusters = cluster_candidates(window_unthemed, archive_unthemed, existing)
     tagged = tag_new_vs_updated(active, _referenced_ids_all(prior), prior_since(prior))
     urgents = urgent_candidates(active)
-    radar = deadline_hits(all_state, archive, now)
+    # The expired passed-tail is a once-only notice: after the write step has
+    # logged the expiry, repeating it for the rest of DEADLINE_TAIL_DAYS would
+    # make expiry itself re-nag for a week.
+    tail_shown = expired_tail_already_shown(ack_store, ack_statuses, STATE_DIR)
+    radar = [
+        record for record in deadline_hits(all_state, radar_archive, now)
+        if not (record["days_until"] < 0 and record["signal"].get("id") in tail_shown)
+    ]
     delta = delta_precompute(prior, active, prior_themes)
+    state_by_id = {signal.get("id"): signal for signal in all_state if signal.get("id")}
     prior_channels = (prior or {}).get("channels") or {}
     channels = _channels(active, prior_channels, prior_themes)
     result_channels: dict[str, dict] = {}
@@ -538,7 +649,7 @@ def build_pre(state: dict, prior: dict | None, now: datetime) -> dict:
         drops = [drop for drop in carry["drops"] if drop.get("channel") == channel]
         channel_life = lifecycle["channels"].get(channel, {})
         result_channels[channel] = {
-            "carryover": {"themes": prior_themes.get(channel, []), "drops": drops},
+            "carryover": {"themes": _carried_with_titles(prior_themes.get(channel, []), state_by_id), "drops": drops},
             "retirements_to_review": [
                 item for item in lifecycle["retirements"] if item.get("channel") == channel
             ],
@@ -665,6 +776,22 @@ def _final_delta(prior: dict, channels: dict[str, dict]) -> dict:
     return {"since": prior_since(prior), "channels": output}
 
 
+def _theme_set_turned_over(prior_themes: list[dict], final_themes: list[dict]) -> bool:
+    """Did this channel's theme set change materially since the prior landscape?
+
+    The predicate is deliberately blunt and mechanical (I22a): it is true when a
+    theme name appears or disappears — a birth, a death, or a rename — or when a
+    surviving theme LOST a member. A theme that only gained members is ordinary
+    accretion, and a summary written last run usually still reads true, so pure
+    additions do not raise the flag.
+    """
+    prior_members = {str(theme.get("theme")): set(theme.get("signal_ids") or []) for theme in prior_themes}
+    final_members = {str(theme.get("theme")): set(theme.get("signal_ids") or []) for theme in final_themes}
+    if set(prior_members) != set(final_members):
+        return True
+    return any(prior_members[name] - final_members[name] for name in prior_members)
+
+
 def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) -> tuple[dict, list[dict]]:
     """Return the v3 skeleton and named prose slots, without writing a file."""
     all_state, active = list(state.get("signals") or []), _active(list(state.get("signals") or []))
@@ -681,9 +808,34 @@ def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) ->
     cluster_window, cluster_archive = unthemed_pool(active, archive, carried_ids)
     cluster_support = cluster_candidates(cluster_window, cluster_archive)
     prior_channels = (prior or {}).get("channels") or {}
-    channels = _channels(active, prior_channels, drafted)
-    radar = deadline_hits(all_state, archive, now)
-    ordinary_urgent = urgent_candidates(active)
+    radar_archive = deadline_archive(now)
+    radar = deadline_hits(all_state, radar_archive, now)
+
+    # --- ack suppression, applied before sorting and before any cap ---
+    # `handled` and `expired` leave the action surfaces entirely; `acknowledged`
+    # stays, keeps its marker, and still occupies a slot under the urgent cap.
+    # Theme membership is never touched by ack state — themes record the state
+    # of the world, acks record the user's relationship to it.
+    ack_statuses = effective_statuses(load_ack_store(), all_state, now, radar_archive)
+    suppressed = {sid for sid, status in ack_statuses.items() if status in ("handled", "expired")}
+    surfaced = [signal for signal in active if signal.get("id") not in suppressed]
+    ordinary_urgent = urgent_candidates(surfaced)
+
+    mandatory_by_channel: dict[str, list[dict]] = {}
+    for record in mandatory_deadline_records(radar, ack_statuses):
+        mandatory_by_channel.setdefault(str(record["signal"].get("channel")), []).append(record)
+
+    # I17: the finish key set is "channels with something to say" — active
+    # signals, drafted themes, or a forced deadline whose signal already left
+    # the window. Unioning in the PRIOR landscape's keys (as this did) made an
+    # emptied channel self-perpetuate with model-written padding forever.
+    # `--pre` still unions them: it needs prior keys to compute carryover/drops.
+    drafted_with_themes = {channel: themes for channel, themes in drafted.items() if themes}
+    channels = _channels(
+        active,
+        drafted_with_themes,
+        [record["signal"] for records in mandatory_by_channel.values() for record in records],
+    )
     sections: dict[str, dict] = {}
     slots: list[dict] = []
     for channel in channels:
@@ -740,11 +892,9 @@ def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) ->
                 item["formerly"] = list(overlap.get("formerly") or []) + [overlap.get("theme")]
             finalized_themes.append(item)
         finalized_themes.sort(key=lambda item: _theme_key_for_ids(item["signal_ids"], active_by_id), reverse=True)
-        # Forward band only: a just-passed deadline (the radar's tail) is
-        # awareness, not a mandatory urgent — the design's rule is "upcoming
-        # within the band", so bound below at 0.
-        mandatory = [record for record in radar if record["signal"].get("channel") == channel and 0 <= record["days_until"] <= MANDATORY_URGENT_DAYS]
-        urgent_by_id = {signal["id"]: signal for signal in ordinary_urgent.get(channel, [])}
+        mandatory = mandatory_by_channel.get(channel, [])
+        ordinary_by_id = {signal["id"]: signal for signal in ordinary_urgent.get(channel, [])}
+        urgent_by_id = dict(ordinary_by_id)
         mandatory_meta: dict[str, dict] = {}
         for record in mandatory:
             signal = record["signal"]
@@ -755,13 +905,23 @@ def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) ->
         urgent = []
         for signal in urgent_records:
             sid = signal["id"]
-            urgent.append({"id": sid, "why": prior_urgent.get(sid, {}).get("why", "")})
+            entry = {"id": sid, "why": prior_urgent.get(sid, {}).get("why", "")}
+            if ack_statuses.get(sid) == "acknowledged":
+                entry["ack"] = "acknowledged"
+            # I21, mark don't gate: only an entry the deadline rule FORCED in
+            # gets the lane marker. A signal that is urgent on its own merits
+            # and merely carries a date is an incident, not a dated obligation.
+            if sid in mandatory_meta and sid not in ordinary_by_id:
+                entry["via"] = "deadline"
+            urgent.append(entry)
         urgent_ids = {item["id"] for item in urgent}
         assigned = {sid for theme in finalized_themes for sid in theme["signal_ids"]}
-        notables = [
-            {"id": signal["id"], "title": signal.get("title")}
-            for signal in select_notables([signal for signal in active if signal.get("channel") == channel and signal.get("id") not in assigned], urgent_ids)
-        ]
+        notables = []
+        for signal in select_notables([signal for signal in surfaced if signal.get("channel") == channel and signal.get("id") not in assigned], urgent_ids):
+            entry = {"id": signal["id"], "title": signal.get("title")}
+            if ack_statuses.get(signal["id"]) == "acknowledged":
+                entry["ack"] = "acknowledged"
+            notables.append(entry)
         section = {
             "summary": prior_section.get("summary", ""), "urgent_signals": urgent,
             "active_themes": finalized_themes, "notable_signals": notables,
@@ -771,6 +931,11 @@ def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) ->
         summary_slot = {"slot": f"channels.{channel}.summary"}
         if "summary" in prior_section:
             summary_slot["value"] = prior_section.get("summary", "")
+            # I22a: a pre-filled summary is only safe to reuse while the channel's
+            # storyline set held still. The flag is advisory — it tells the prose
+            # turn which reused paragraphs to re-read, not which to rewrite.
+            if _theme_set_turned_over(prior_themes, finalized_themes):
+                summary_slot["stale_risk"] = True
         slots.append(summary_slot)
         for entry in urgent:
             sid = entry["id"]
@@ -813,6 +978,71 @@ def _apply_prose(skeleton: dict, slots: list[dict], prose: dict) -> dict:
     return skeleton
 
 
+def build_gate(state: dict, landscape: dict | None, now: datetime) -> dict:
+    """Report whether the passage of TIME alone has made the landscape wrong.
+
+    The pipeline is driven by sync's new/updated counts, so a quiet poll stops
+    before the finish step — and every ack rule that turns on a clock rather than
+    on an arriving signal silently stalls with it. An acknowledged deadline
+    synthesized at four days out would never re-enter the urgent list when it
+    reached three; a passed deadline would never expire; a once-only tail would
+    never be shown or retired. This is the cheap mechanical check for exactly
+    those four cases. It reads state, the landscape, the ack store and the
+    radar's archive coverage, and writes nothing.
+    """
+    state_signals = list(state.get("signals") or [])
+    store = load_ack_store()
+    radar_archive = deadline_archive(now)
+    statuses = effective_statuses(store, state_signals, now, radar_archive)
+    radar = deadline_hits(state_signals, radar_archive, now)
+
+    channels = (landscape or {}).get("channels") or {}
+    listed_urgent = {
+        str(item.get("id"))
+        for section in channels.values()
+        if isinstance(section, dict)
+        for item in section.get("urgent_signals") or []
+    }
+
+    newly_mandatory: list[str] = []
+    final_nag_due: list[str] = []
+    for record in mandatory_deadline_records(radar, statuses):
+        sid = str(record["signal"].get("id"))
+        if sid in listed_urgent:
+            continue
+        newly_mandatory.append(sid)
+        if statuses.get(sid) == "acknowledged":
+            final_nag_due.append(sid)
+
+    shown = expired_tail_already_shown(store, statuses, STATE_DIR)
+    unshown_tail = sorted({
+        str(record["signal"].get("id")) for record in radar
+        if record["days_until"] < 0
+        and statuses.get(record["signal"].get("id")) == "expired"
+        and record["signal"].get("id") not in shown
+    })
+
+    pending = [
+        {"id": item["id"], "from": item["from"], "to": item["to"]}
+        for item in pending_transitions(store, state_signals, now, radar_archive)
+    ]
+    result = {
+        "checked_at": _iso(now),
+        "landscape_as_of": (landscape or {}).get("as_of"),
+        "pending_ack_transitions": pending,
+        "newly_mandatory_urgents": sorted(set(newly_mandatory)),
+        # A subset of the line above, named separately because it is the rule
+        # most likely to be wrong-looking in the field: "you noted this, and it
+        # is now imminent".
+        "final_nag_due": sorted(set(final_nag_due)),
+        "unshown_expired_tail": unshown_tail,
+    }
+    result["stale"] = bool(
+        pending or result["newly_mandatory_urgents"] or result["final_nag_due"] or unshown_tail
+    )
+    return result
+
+
 def _parse_args(argv: list[str]) -> tuple[str, Path | None, Path | None]:
     mode = ""
     draft = prose = None
@@ -820,16 +1050,18 @@ def _parse_args(argv: list[str]) -> tuple[str, Path | None, Path | None]:
     while index < len(argv):
         if argv[index] == "--pre":
             mode = "pre"; index += 1
+        elif argv[index] == "--gate":
+            mode = "gate"; index += 1
         elif argv[index] == "--finish" and index + 1 < len(argv):
             mode = "finish"; draft = Path(argv[index + 1]); index += 2
         elif argv[index] == "--prose" and index + 1 < len(argv):
             prose = Path(argv[index + 1]); index += 2
         else:
             raise ValueError(f"unknown or incomplete argument {argv[index]!r}")
-    if mode == "pre" and (draft or prose):
-        raise ValueError("--pre takes no input files")
-    if mode != "pre" and (mode != "finish" or draft is None):
-        raise ValueError("use --pre or --finish <draft.json>")
+    if mode in ("pre", "gate") and (draft or prose):
+        raise ValueError(f"--{mode} takes no input files")
+    if mode not in ("pre", "gate") and (mode != "finish" or draft is None):
+        raise ValueError("use --pre, --gate, or --finish <draft.json>")
     return mode, draft, prose
 
 
@@ -847,6 +1079,11 @@ def main() -> None:
             if backup is not None:
                 prior = backup
         now = datetime.now(timezone.utc)
+        if mode == "gate":
+            # The gate asks about the landscape as WRITTEN, so it deliberately
+            # skips the mid-run prior-backup swap above.
+            print(json.dumps(build_gate(state, _load_json(LANDSCAPE_PATH, required=False), now), indent=2))
+            return
         if mode == "pre":
             print(json.dumps(build_pre(state, prior, now), indent=2))
             return
@@ -859,8 +1096,16 @@ def main() -> None:
         LANDSCAPE_PATH.parent.mkdir(parents=True, exist_ok=True)
         existing = _load_json(LANDSCAPE_PATH, required=False)
         if existing is not None and existing.get("updated_through_seq") != skeleton["updated_through_seq"]:
-            PRIOR_BACKUP_PATH.write_text(json.dumps(existing, indent=2) + "\n")
-        LANDSCAPE_PATH.write_text(json.dumps(_apply_prose(skeleton, slots, prose), indent=2) + "\n")
+            _atomic_write_json(PRIOR_BACKUP_PATH, existing)
+        # Same crash-safety contract as the ack store (F3): a partial landscape
+        # write would hard-fail every later _load_json of the prior.
+        _atomic_write_json(LANDSCAPE_PATH, _apply_prose(skeleton, slots, prose))
+        # `--pre` is intentionally pure. The finish/prose path is the one
+        # mechanical write step, so it is also where automatic lifecycle facts
+        # become durable. The helper is idempotent across validate-fix reruns.
+        persist_effective_transitions(
+            list(state.get("signals") or []), STATE_DIR, now, deadline_archive(now)
+        )
         print(json.dumps({"written": str(LANDSCAPE_PATH)}, indent=2))
     except ValueError as exc:
         print(f"assemble: {exc}", file=sys.stderr)
