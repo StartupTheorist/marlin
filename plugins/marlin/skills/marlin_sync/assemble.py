@@ -792,7 +792,13 @@ def _theme_set_turned_over(prior_themes: list[dict], final_themes: list[dict]) -
     return any(prior_members[name] - final_members[name] for name in prior_members)
 
 
-def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) -> tuple[dict, list[dict]]:
+def build_finish(
+    state: dict,
+    prior: dict | None,
+    draft: dict,
+    now: datetime,
+    radar_archive: list[dict] | None = None,
+) -> tuple[dict, list[dict]]:
     """Return the v3 skeleton and named prose slots, without writing a file."""
     all_state, active = list(state.get("signals") or []), _active(list(state.get("signals") or []))
     active_by_id = {signal.get("id"): signal for signal in active if signal.get("id")}
@@ -808,7 +814,8 @@ def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) ->
     cluster_window, cluster_archive = unthemed_pool(active, archive, carried_ids)
     cluster_support = cluster_candidates(cluster_window, cluster_archive)
     prior_channels = (prior or {}).get("channels") or {}
-    radar_archive = deadline_archive(now)
+    if radar_archive is None:
+        radar_archive = deadline_archive(now)
     radar = deadline_hits(all_state, radar_archive, now)
 
     # --- ack suppression, applied before sorting and before any cap ---
@@ -925,7 +932,10 @@ def build_finish(state: dict, prior: dict | None, draft: dict, now: datetime) ->
         section = {
             "summary": prior_section.get("summary", ""), "urgent_signals": urgent,
             "active_themes": finalized_themes, "notable_signals": notables,
-            "entities_to_watch": entities_to_watch([signal for signal in active if signal.get("channel") == channel], " ".join(item["theme"] for item in finalized_themes)),
+            "entities_to_watch": entities_to_watch(
+                [signal for signal in active if signal.get("channel") == channel],
+                finalized_themes,
+            ),
         }
         sections[channel] = section
         summary_slot = {"slot": f"channels.{channel}.summary"}
@@ -1088,7 +1098,8 @@ def main() -> None:
             print(json.dumps(build_pre(state, prior, now), indent=2))
             return
         draft = _load_json(draft_path, required=True) if draft_path else None
-        skeleton, slots = build_finish(state, prior, draft or {}, now)
+        radar_archive = deadline_archive(now)
+        skeleton, slots = build_finish(state, prior, draft or {}, now, radar_archive)
         if prose_path is None:
             print(json.dumps({"landscape": skeleton, "slots": slots}, indent=2))
             return
@@ -1104,7 +1115,7 @@ def main() -> None:
         # mechanical write step, so it is also where automatic lifecycle facts
         # become durable. The helper is idempotent across validate-fix reruns.
         persist_effective_transitions(
-            list(state.get("signals") or []), STATE_DIR, now, deadline_archive(now)
+            list(state.get("signals") or []), STATE_DIR, now, radar_archive
         )
         print(json.dumps({"written": str(LANDSCAPE_PATH)}, indent=2))
     except ValueError as exc:
