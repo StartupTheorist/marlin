@@ -92,7 +92,7 @@ def _parse_time(value: object) -> datetime | None:
 def signal_entry(signal: dict) -> dict:
     """Return the pinned triage-weight signal entry used by assemble data."""
     created = ulid_created_at(signal.get("id"))
-    return {
+    entry = {
         "id": signal.get("id"),
         "channel": signal.get("channel"),
         "handling": signal.get("handling"),
@@ -107,6 +107,11 @@ def signal_entry(signal: dict) -> dict:
         "created_at": created.date().isoformat() if created else None,
         "annotations": dict(signal.get("annotations") or {}),
     }
+    # Provenance flag (I16): present only when true — the publisher is an
+    # interested party in a claim about the world beyond itself.
+    if signal.get("interested_party"):
+        entry["interested_party"] = True
+    return entry
 
 
 def prior_since(prior_landscape: dict | None) -> str | int | None:
