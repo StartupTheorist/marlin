@@ -109,7 +109,7 @@ skill's rules require, so the agent doesn't do it by hand):
                           trailing Z (`YYYY-MM-DDTHH:MM:SSZ`), for the
                           landscape's `as_of`. Needs no state file.
 
-Precedence: --now > --ids > --channels > --theme-key > --retired-since >
+Precedence: --now > --archive --ids > --ids > --channels > --theme-key > --retired-since >
 --landscape-survivors > --archive > --deadlines > --entity-candidates >
 --urgent-top > --by-channel/default (the latter honoring --channel and
 --since-seq).
@@ -145,6 +145,8 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from params import DEADLINE_TAIL_DAYS, RADAR_HORIZON_DAYS, URGENT_CAP
+
 # Resolve the state directory the same way sync.py does (MARLIN_STATE_DIR, else
 # ~/.marlin) so reads find what sync.py wrote regardless of cwd. `--state-dir`
 # prints it so the skill can read/write the landscape in the same place.
@@ -152,7 +154,6 @@ STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")
 STATE_PATH = STATE_DIR / "marlin_state.json"
 LANDSCAPE_PATH = STATE_DIR / "marlin_landscape.json"
 ARCHIVE_DIR = STATE_DIR / "marlin_archive"
-URGENT_TOP_DEFAULT = 5
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -345,7 +346,7 @@ def _parse_argv(argv: list[str]) -> dict[str, object]:
                 out["urgent_top"] = argv[i + 1]
                 i += 2
             else:
-                out["urgent_top"] = str(URGENT_TOP_DEFAULT)
+                out["urgent_top"] = str(URGENT_CAP)
                 i += 1
         elif "=" in arg and arg.split("=", 1)[0] == "--urgent-top":
             out["urgent_top"] = arg.split("=", 1)[1]
@@ -591,11 +592,6 @@ def _recent_archive_months(now: datetime) -> set[str]:
     return {cur, prior}
 
 
-# The just-passed tail: a deadline up to this many days in the past still shows
-# on the radar, so a date that slipped by is visible rather than silently gone.
-DEADLINE_TAIL_DAYS = 7
-
-
 def _deadline_radar(
     state_signals: list[dict],
     archive_signals: list[dict],
@@ -702,13 +698,8 @@ def _print_entity_candidates(signals: list[dict]) -> None:
             print(f"{ent}\t{len(ids)}\t{','.join(ids)}")
 
 
-def _print_entity_candidates_final(chan_signals: list[dict], themes_blob: str) -> None:
-    """The final paste-ready entities_to_watch JSON array for ONE channel
-    (S12): qualifying entities (≥2 signals, same rule as
-    _qualifying_entities) minus those named in the channel's theme blob —
-    `ent.lower()` as a substring of `themes_blob.lower()`, matching
-    validate.py's theme_blob check exactly. Sorted count desc then entity
-    name asc; each entry's signal_ids sorted by updated_seq descending."""
+def entities_to_watch(chan_signals: list[dict], themes_blob: str) -> list[dict]:
+    """Return the final deterministic entities_to_watch value for one channel."""
     qualifying = _qualifying_entities(chan_signals)
     blob = themes_blob.lower()
     by_id = {s.get("id"): s for s in chan_signals}
@@ -716,12 +707,21 @@ def _print_entity_candidates_final(chan_signals: list[dict], themes_blob: str) -
     for ent in sorted(qualifying, key=lambda e: (-len(qualifying[e]), e)):
         if ent.lower() in blob:
             continue
-        ids = qualifying[ent]
-        sorted_ids = sorted(
-            ids, key=lambda sid: by_id[sid].get("updated_seq", 0), reverse=True
+        ids = sorted(
+            qualifying[ent], key=lambda sid: by_id[sid].get("updated_seq", 0), reverse=True
         )
-        result.append({"entity": ent, "signal_ids": sorted_ids})
-    print(json.dumps(result, indent=2))
+        result.append({"entity": ent, "signal_ids": ids})
+    return result
+
+
+def _print_entity_candidates_final(chan_signals: list[dict], themes_blob: str) -> None:
+    """The final paste-ready entities_to_watch JSON array for ONE channel
+    (S12): qualifying entities (≥2 signals, same rule as
+    _qualifying_entities) minus those named in the channel's theme blob —
+    `ent.lower()` as a substring of `themes_blob.lower()`, matching
+    validate.py's theme_blob check exactly. Sorted count desc then entity
+    name asc; each entry's signal_ids sorted by updated_seq descending."""
+    print(json.dumps(entities_to_watch(chan_signals, themes_blob), indent=2))
 
 
 def _print_urgent_top(signals: list[dict], n: int) -> None:
@@ -731,20 +731,41 @@ def _print_urgent_top(signals: list[dict], n: int) -> None:
         if i:
             print()
         print(f"## {cid}")
-        urgent = [
-            s
-            for s in signals
-            if s.get("channel", "?") == cid and s.get("handling") == "urgent"
+        all_urgent = [
+            signal
+            for signal in signals
+            if signal.get("channel", "?") == cid
+            and signal.get("handling") == "urgent"
+            and _is_active(signal)
         ]
-        urgent.sort(
-            key=lambda s: (_as_float(s.get("importance")), s.get("updated_seq", 0)),
-            reverse=True,
-        )
+        urgent = urgent_top(signals, n).get(cid, [])
         for s in urgent[:n]:
             print(_format_signal(s))
-        dropped = len(urgent) - n
+        dropped = len(all_urgent) - n
         if dropped > 0:
             print(f"# dropped {dropped} beyond top {n}")
+
+
+def urgent_top(signals: list[dict], cap: int = URGENT_CAP) -> dict[str, list[dict]]:
+    """Return active urgent signals per channel using --urgent-top's ordering."""
+    result: dict[str, list[dict]] = {}
+    for cid in _channel_order(signals):
+        urgent = [
+            signal
+            for signal in signals
+            if signal.get("channel", "?") == cid
+            and signal.get("handling") == "urgent"
+            and _is_active(signal)
+        ]
+        urgent.sort(
+            key=lambda signal: (
+                _as_float(signal.get("importance")),
+                signal.get("updated_seq", 0),
+            ),
+            reverse=True,
+        )
+        result[cid] = urgent[:cap]
+    return result
 
 
 def main() -> None:
@@ -765,8 +786,26 @@ def main() -> None:
     # operate on the FULL state — you can still inspect a retired (superseded)
     # signal by id. Every aggregate/triage view below operates on active-only, so
     # retired signals never enter the landscape (A8b deliver-then-drop).
+    if "ids" in args and args.get("archive"):
+        archived, skipped = _load_archive()
+        _print_ids(archived, str(args["ids"]))
+        if skipped:
+            print(f"warning: skipped {skipped} malformed archive line(s)", file=sys.stderr)
+        return
+
     if "ids" in args:
-        _print_ids(all_signals, str(args["ids"]))
+        # State first, archive as automatic fallback: a superseded signal is
+        # still in state; a trimmed one lives only in the archive. One flag
+        # resolves either, so callers never guess which corpus an id is in.
+        wanted = {sid.strip() for sid in str(args["ids"]).split(",") if sid.strip()}
+        known = {s.get("id") for s in all_signals}
+        corpus = all_signals
+        if wanted - known:
+            archived, skipped = _load_archive()
+            corpus = all_signals + [r for r in archived if r.get("id") not in known]
+            if skipped:
+                print(f"warning: skipped {skipped} malformed archive line(s)", file=sys.stderr)
+        _print_ids(corpus, str(args["ids"]))
         return
 
     # --theme-key: look up across the full state (themes are within a channel,
@@ -825,7 +864,7 @@ def main() -> None:
     # (incl. retired) on purpose: the radar filters active internally, and a
     # retired-in-state id must still block its stale archive snapshot.
     if args.get("deadlines"):
-        horizon = 21
+        horizon = RADAR_HORIZON_DAYS
         if "horizon" in args:
             try:
                 horizon = int(str(args["horizon"]))

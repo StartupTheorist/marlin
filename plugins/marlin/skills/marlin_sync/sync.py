@@ -35,11 +35,11 @@ State files (written in MARLIN_STATE_DIR):
 
 Output:
     stdout: one line, e.g.
-        synced 12 new signals, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
+        synced 12 new, 3 re-updated, 1 superseded, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
     or, when the trim evicted signals from the window this run:
-        synced 12 new signals, archived 4, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
+        synced 12 new, 3 re-updated, 1 superseded, archived 4, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
     or, when the per-channel floor changed the retained set:
-        synced 12 new signals, archived 4, floor protected 3, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
+        synced 12 new, 3 re-updated, 1 superseded, archived 4, floor protected 3, cursor=seq:64, last_new_signal_at=2026-04-17T19:22:05Z
     stderr: errors (auth, unreachable, corrupt state). Exits non-zero.
 """
 
@@ -55,6 +55,8 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
+from params import CHANNEL_FLOOR, WINDOW_SIZE
+
 # State lives in a stable directory, not the cwd, so a scheduled run launched
 # from an arbitrary/ephemeral working dir still finds prior state (otherwise it
 # cold-starts every run — re-syncing the whole window and defeating diff mode).
@@ -63,8 +65,8 @@ STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")
 STATE_PATH = STATE_DIR / "marlin_state.json"
 BACKUP_PATH = STATE_DIR / "marlin_state.json.bak"
 ARCHIVE_DIR = STATE_DIR / "marlin_archive"
-WINDOW = int(os.environ.get("MARLIN_WINDOW") or 100)
-FLOOR = int(os.environ.get("MARLIN_CHANNEL_FLOOR") or 10)
+WINDOW = WINDOW_SIZE
+FLOOR = CHANNEL_FLOOR
 PAGE_LIMIT = 100
 MAX_PAGES = 50
 TIMEOUT_SECONDS = 30
@@ -261,6 +263,8 @@ def main() -> None:
     prior_last_new = state.get("last_new_signal_at")
 
     new_count = 0
+    reupdated_count = 0
+    superseded_count = 0
     next_cursor = cursor
     pages = 0
     while True:
@@ -275,6 +279,9 @@ def main() -> None:
                 new_count += 1
             elif s.get("updated_seq", 0) > existing.get("updated_seq", 0):
                 signals_by_id[sid] = s
+                reupdated_count += 1
+            if s.get("status", "active") != "active":
+                superseded_count += 1
         next_cursor = page.get("next_cursor") or next_cursor
         pages += 1
         if not page.get("has_more"):
@@ -287,7 +294,7 @@ def main() -> None:
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)  # ensure the state dir exists before writing
 
-    if new_count == 0:
+    if new_count == 0 and reupdated_count == 0:
         state["version"] = 1
         state["last_sync"] = now
         if next_cursor:
@@ -296,7 +303,7 @@ def main() -> None:
         STATE_PATH.write_text(json.dumps(state, indent=2))
         last_new = prior_last_new or "never"
         print(
-            f"{prefix}synced 0 new signals, "
+            f"{prefix}synced 0 new, 0 re-updated, {superseded_count} superseded, "
             f"cursor={state.get('cursor')}, last_new_signal_at={last_new}"
         )
         return
@@ -311,16 +318,18 @@ def main() -> None:
     new_state = {
         "version": 1,
         "last_sync": now,
-        "last_new_signal_at": now,
+        "last_new_signal_at": now if new_count else prior_last_new,
         "cursor": next_cursor,
         "signals": trimmed,
     }
     STATE_PATH.write_text(json.dumps(new_state, indent=2))
     archived_segment = f", archived {len(evicted)}" if evicted else ""
     floor_segment = f", floor protected {floor_protected}" if floor_protected else ""
+    last_new = now if new_count else (prior_last_new or "never")
     print(
-        f"{prefix}synced {new_count} new signals{archived_segment}{floor_segment}, "
-        f"cursor={next_cursor}, last_new_signal_at={now}"
+        f"{prefix}synced {new_count} new, {reupdated_count} re-updated, "
+        f"{superseded_count} superseded{archived_segment}{floor_segment}, "
+        f"cursor={next_cursor}, last_new_signal_at={last_new}"
     )
 
 

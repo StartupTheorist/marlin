@@ -46,7 +46,11 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+from inspect import _deadline_radar, _parse_deadline_date
+from params import MANDATORY_URGENT_DAYS, URGENT_CAP
 
 # Both files live in the shared state directory (MARLIN_STATE_DIR, else
 # ~/.marlin), the same one sync.py/inspect.py resolve — so the validator lints
@@ -54,7 +58,7 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("MARLIN_STATE_DIR") or (Path.home() / ".marlin")).expanduser()
 STATE_PATH = STATE_DIR / "marlin_state.json"
 LANDSCAPE_PATH = STATE_DIR / "marlin_landscape.json"
-URGENT_CAP = 5
+ARCHIVE_DIR = STATE_DIR / "marlin_archive"
 AS_OF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
@@ -88,6 +92,27 @@ def _theme_key(signal_ids: list[str], by_id: dict[str, dict]) -> tuple[float, in
     return (max_imp, len(signal_ids), max_seq)
 
 
+def _load_archive() -> dict[str, dict]:
+    """Load all archived records for the v3 mandatory-deadline exception."""
+    if not ARCHIVE_DIR.is_dir():
+        return {}
+    found: dict[str, dict] = {}
+    for path in ARCHIVE_DIR.glob("*.jsonl"):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = item.get("id")
+            if sid and (sid not in found or item.get("archived_at", "") > found[sid].get("archived_at", "")):
+                found[sid] = item
+    return found
+
+
 def validate(landscape: dict, state: dict) -> list[str]:
     """Return a list of violation strings (empty == clean)."""
     v: list[str] = []
@@ -95,8 +120,9 @@ def validate(landscape: dict, state: dict) -> list[str]:
     by_id = {s.get("id"): s for s in signals if s.get("id")}
 
     # --- top-level ---
-    if landscape.get("version") != 2:
-        v.append(f"version is {landscape.get('version')!r}, expected 2")
+    version = landscape.get("version")
+    if version not in (2, 3):
+        v.append(f"version is {version!r}, expected 2 or 3")
 
     as_of = landscape.get("as_of")
     if not isinstance(as_of, str) or not AS_OF_RE.match(as_of):
@@ -115,8 +141,14 @@ def validate(landscape: dict, state: dict) -> list[str]:
         v.append("channels is missing or empty")
         return v
 
+    archive_by_id = _load_archive() if version == 3 else {}
     for cid, section in channels.items():
-        v.extend(_validate_channel(cid, section, by_id))
+        v.extend(_validate_channel(cid, section, by_id, archive_by_id, version == 3))
+
+    if version == 3 and "delta" in landscape:
+        delta = landscape["delta"]
+        if not isinstance(delta, dict) or "since" not in delta or not isinstance(delta.get("channels"), dict):
+            v.append("delta must be an object with since and channels")
 
     # --- cross_channel (optional) ---
     cc = landscape.get("cross_channel")
@@ -126,19 +158,24 @@ def validate(landscape: dict, state: dict) -> list[str]:
     return v
 
 
-def _validate_channel(cid: str, section: dict, by_id: dict[str, dict]) -> list[str]:
+def _validate_channel(cid: str, section: dict, by_id: dict[str, dict], archive_by_id: dict[str, dict], v3: bool) -> list[str]:
     v: list[str] = []
     if not isinstance(section, dict):
         return [f"[{cid}] section is not an object"]
 
-    for key in ("summary", "urgent_signals", "active_themes", "entities_to_watch"):
+    required = ("summary", "urgent_signals", "active_themes", "entities_to_watch")
+    if v3:
+        required += ("notable_signals",)
+    for key in required:
         if key not in section:
             v.append(f"[{cid}] missing '{key}'")
 
     chan_signals = [s for s in by_id.values() if s.get("channel") == cid and _is_active(s)]
 
-    def _ref_ok(sid: str, where: str) -> bool:
+    def _ref_ok(sid: str, where: str, *, allow_archived_deadline: bool = False) -> bool:
         s = by_id.get(sid)
+        if s is None and allow_archived_deadline:
+            s = archive_by_id.get(sid)
         if s is None:
             v.append(f"[{cid}] {where} references unknown signal id {sid!r}")
             return False
@@ -165,6 +202,8 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict]) -> list[s
         name = t.get("theme", "?")
         theme_names.append(name)
         sids = t.get("signal_ids") or []
+        if v3 and "named_member_ids" not in t:
+            v.append(f"[{cid}] theme {name!r} missing 'named_member_ids'")
         for sid in sids:
             _ref_ok(sid, f"theme {name!r}")
             if sid in seen_in_theme:
@@ -229,25 +268,52 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict]) -> list[s
 
     # --- urgent_signals: cap, sort, handling source ---
     urgent = section.get("urgent_signals") or []
-    if len(urgent) > URGENT_CAP:
-        v.append(f"[{cid}] urgent_signals has {len(urgent)} entries; cap is {URGENT_CAP}")
     sort_keys: list[tuple[float, int]] = []
+    ordinary = 0
+    urgent_ids: set[str] = set()
     for u in urgent:
         sid = u.get("id", "?")
-        if _ref_ok(sid, "urgent_signals"):
-            s = by_id[sid]
-            if s.get("handling") != "urgent":
+        urgent_ids.add(sid)
+        archived = sid not in by_id and sid in archive_by_id
+        if _ref_ok(sid, "urgent_signals", allow_archived_deadline=v3):
+            s = by_id.get(sid) or archive_by_id.get(sid)
+            deadline = _parse_deadline_date(s.get("deadline_at"))
+            # A brief signal may appear here only when its deadline is inside the
+            # mandatory band.  This is the v3 exception to the v2 handling rule.
+            mandatory = v3 and deadline is not None and 0 <= (deadline - datetime.now(timezone.utc).date()).days <= MANDATORY_URGENT_DAYS
+            if s.get("handling") != "urgent" and not mandatory:
                 v.append(
                     f"[{cid}] urgent_signals includes {sid!r} whose handling is "
                     f"{s.get('handling')!r}, not 'urgent'"
                 )
+            if not mandatory:
+                ordinary += 1
             sort_keys.append((_as_float(s.get("importance")), s.get("updated_seq", 0)))
+    if ordinary > URGENT_CAP:
+        v.append(f"[{cid}] urgent_signals has {ordinary} ordinary entries; cap is {URGENT_CAP}")
     for i in range(len(sort_keys) - 1):
         if sort_keys[i] < sort_keys[i + 1]:
             v.append(
                 f"[{cid}] urgent_signals out of order at position {i} "
                 "(sort: importance desc, updated_seq desc)"
             )
+
+    # --- notable_signals (v3): grounded, brief-only, and distinct from urgent ---
+    if v3:
+        for notable in section.get("notable_signals") or []:
+            sid = notable.get("id", "?")
+            if sid in urgent_ids:
+                v.append(f"[{cid}] signal {sid!r} appears in both urgent_signals and notable_signals")
+            if _ref_ok(sid, "notable_signals"):
+                if by_id[sid].get("handling") != "brief":
+                    v.append(f"[{cid}] notable_signals includes {sid!r} whose handling is not 'brief'")
+            ack = notable.get("ack")
+            if ack is not None and ack != "acknowledged":
+                v.append(f"[{cid}] notable_signals ack must be 'acknowledged'")
+        for item in urgent:
+            ack = item.get("ack")
+            if ack is not None and ack != "acknowledged":
+                v.append(f"[{cid}] urgent_signals ack must be 'acknowledged'")
 
     return v
 
