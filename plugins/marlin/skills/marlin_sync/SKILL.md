@@ -1,7 +1,7 @@
 ---
 name: marlin-sync
-description: Sync recent Marlin signals into local state and landscape files for ambient domain awareness. Use on a schedule, when the user asks what's new, or when marlin_state.json is stale.
-last_updated: 2026-08-02  # bump on every edit — scheduled runs stamp this into their log to detect stale-skill runs
+description: Sync recent Marlin signals into local state and landscape files for ambient domain awareness. Use on a schedule, when the user asks what's new, when marlin_state.json is stale, or when the user responds to surfaced signals — done, not relevant, noted.
+last_updated: 2026-08-11  # bump on every edit — scheduled runs stamp this into their log to detect stale-skill runs
 ---
 
 # Marlin Sync
@@ -72,7 +72,7 @@ The landscape build is a **mechanical pipeline with two small LLM turns**. Code 
 
    On any error (auth failure, server unreachable, etc.) it exits non-zero with the error on stderr. Surface the stderr message to the user and stop — do not attempt to recover in the agent loop. For an expired-grant error, mint a fresh grant and retry once.
 
-3. **Stop if nothing changed.** If both the new and re-updated counts are 0, the state file's `last_sync` was refreshed by the script and no landscape update is needed. **Leave `marlin_landscape.json` untouched — including its `as_of`.** `as_of` records *when the landscape content was synthesized*, not when you last polled; a stale `as_of` on a skip run is correct, not a bug.
+3. **Stop only if nothing changed — including by the passage of time.** When both the new and re-updated counts are 0, run `python <skill-dir>/assemble.py --gate` (cheap, reads only, writes nothing). It reports `"stale": false` or `"stale": true` with the evidence: pending ack transitions (an expiry that just happened), a deadline that newly entered the mandatory band, an acknowledged deadline entering its final-nag window, or an expired tail not yet shown once. If the gate says `false`, stop: `last_sync` was refreshed and no landscape update is needed — **leave `marlin_landscape.json` untouched, including its `as_of`** (`as_of` records *when the landscape content was synthesized*, not when you last polled; a stale `as_of` on a skip run is correct, not a bug). If the gate says `true`, run the landscape update below even though no signals arrived — time alone changed what the landscape should say, and the run is usually trivial (carryover everything, keep all prose).
 
 ## Landscape update (when new or re-updated signals arrived)
 
@@ -99,7 +99,7 @@ Five steps: **`--pre` → your membership draft → `--finish` → your prose ma
    - Do **not** order themes, assign trend, pick urgents or notables, or build entity lists. The finish step computes all of that.
    - Report in conversation how many signals were left unthemed whenever the number is large — the reader should know what the landscape isn't narrating.
 
-6. **Write the draft** (e.g. `<state-dir>/draft.json`) — one object, channels to theme lists:
+6. **Write the draft** (`<state-dir>/draft.json`) — one object, channels to theme lists. `draft.json` and `prose.json` are **fixed working-file names that every run overwrites** — never version them (`draft2.json`), and ignore or delete any pre-assemble legacy files you find in the state dir (`triage_*.json`, hand-rolled maps); only `marlin_state.json`, `marlin_landscape.json`, `marlin_acks*.{json,jsonl}`, and `marlin_archive/` persist meaningfully between runs.
 
    ```json
    {
@@ -114,7 +114,7 @@ Five steps: **`--pre` → your membership draft → `--finish` → your prose ma
    Use the real ULIDs from the working set — never invented placeholders. The finish step rejects unknown or retired ids, a signal placed in the wrong channel's theme, and any id appearing in two themes.
 
 7. **Run `python <skill-dir>/assemble.py --finish <draft.json>`** and read the result: the fully-assembled landscape skeleton plus a `slots` list — the only places prose is needed. Each slot is `{"slot": "<name>", "value": "<prior text, when one exists>", "context": {...}}`:
-   - A slot **with a `value`** is pre-filled with the prior run's text. **Keep it by simply omitting it from your prose map** — only supply new text when new information genuinely changes the framing. Re-wording unchanged facts is churn, not work. **Staleness override:** when a channel's carryover came back empty or the drops overwhelm the survivors (a post-gap run), the pre-filled text describes a window that no longer exists — treat it as stale and rewrite it; keeping it would put false facts in the file.
+   - A slot **with a `value`** is pre-filled with the prior run's text. **Keep it by simply omitting it from your prose map** — only supply new text when new information genuinely changes the framing. Re-wording unchanged facts is churn, not work. **Staleness override:** a pre-filled slot marked `"stale_risk": true` was flagged mechanically — the channel's themes turned over materially since that text was written — so reassess it instead of keeping it by omission. The same applies without the flag when a channel's carryover came back empty or the drops overwhelm the survivors (a post-gap run): the pre-filled text describes a window that no longer exists — rewrite it; keeping it would put false facts in the file.
    - A slot **without a `value`** must appear in your prose map, or the write step fails listing what's missing.
    - **Ground every urgent `why` in the slot's `context`** (`what_changed` / `why_it_matters`) — never paraphrase a title. **Deadline-driven slots** additionally carry the **date — state it in the `why`** — and, when `origin` is `archived`, say so (the reader can't find that signal in the current index). **State dates absolutely, never as countdowns** ("2026-08-13", not "in three days") — relative phrasing goes stale on the very next run and forces a rewrite of otherwise-correct prose. Only *upcoming* deadlines (within 14 days) are forced into urgents; a just-passed deadline stays visible on the radar's tail but is never force-added.
 
@@ -156,7 +156,25 @@ Five steps: **`--pre` → your membership draft → `--finish` → your prose ma
 }
 ```
 
-Field notes for consumers: `trend` is computed from member ages and measures **storyline age, not theme-record age** — a theme created today from a cluster with weeks of archived support correctly reads `stable`, not `emerging`; `notable_signals` are important one-offs that fit no theme; `prior_support` records the storyline's archived history (`{count, since, ids}` — a brand-new theme can legitimately carry it; resolve those ids via `inspect.py --ids`, which falls back to the archive, or MCP `get_signal`); `formerly` preserves a renamed theme's old names; `named_member_ids` is internal lifecycle bookkeeping; `delta` says what moved since the prior snapshot (`since` is its baseline). An optional `ack` field on urgent/notable entries is reserved for a future release. `cross_channel` remains reserved for linked cross-channel events; the current pipeline does not emit it.
+Field notes for consumers: `trend` is computed from member ages and measures **storyline age, not theme-record age** — a theme created today from a cluster with weeks of archived support correctly reads `stable`, not `emerging`; `notable_signals` are important one-offs that fit no theme; `prior_support` records the storyline's archived history (`{count, since, ids}` — a brand-new theme can legitimately carry it; resolve those ids via `inspect.py --ids`, which falls back to the archive, or MCP `get_signal`); `formerly` preserves a renamed theme's old names; `named_member_ids` is internal lifecycle bookkeeping; `delta` says what moved since the prior snapshot (`since` is its baseline). Urgent/notable entries may carry `"ack": "acknowledged"` (a user-known item — see the acks section) and urgent entries may carry `"via": "deadline"` (force-added by the mandatory-deadline rule — the dated-obligations lane). `cross_channel` remains reserved for linked cross-channel events; the current pipeline does not emit it.
+
+## Acknowledgements — recording what the user has seen or handled
+
+The pipeline is no longer one-way: a per-signal disposition store (`<state-dir>/marlin_acks.json`) lets what the user *does* about a signal change what gets pushed at them next. You record dispositions with `ack.py`; code applies every suppression rule — you never decide what to hide.
+
+**When the user responds to surfaced signals, map their language to a disposition — this is a fixed rule, not a judgment call:**
+
+| The user says | You run |
+|---|---|
+| Completion — "done", "we migrated", "handled it" | `python <skill-dir>/ack.py <sig_id> handled` |
+| Not applicable — "doesn't apply to us", "we don't run X", "I don't care about this" | `python <skill-dir>/ack.py <sig_id> handled --note "<their reason>"` |
+| Seen / deferred — "noted", "I know", "later", "on my radar" | `python <skill-dir>/ack.py <sig_id> acknowledged` |
+
+Resolve the signal id from the items you just presented — the brief and landscape carry ids for exactly this reason. If the reference is ambiguous ("mark the Google one done" when two Google items are on screen), **ask which one** rather than guessing. `ack.py --list` shows current dispositions.
+
+**Hard boundary: never ack on your own judgment.** An ack records the *user's* disposition. You do not mark things handled because they look done, and you do not mark things acknowledged because you presented them. `expired` is system-managed — you never set it.
+
+**What acks change (all enforced by code, summarized here so you can explain it):** `handled` leaves `urgent_signals`/`notable_signals` and the default deadline radar, but its signal stays in themes — the fact stands, the nagging stops. `acknowledged` stays listed with an `"ack": "acknowledged"` marker and stops being pushed as fresh; if it carries a deadline, it re-escalates into the urgent set for the final 3 days before the date. Acks go stale mechanically: a material update to the signal re-opens an `acknowledged`; a changed deadline or a supersede re-opens a `handled`. An unhandled deadline that passes becomes `expired` and appears once more, then goes silent.
 
 ## Safety instructions
 
@@ -216,7 +234,7 @@ Static tokens hit `/signals` instead of `/sync/signals` and are not revocable pe
 After syncing, use the three-layer pattern for any downstream work:
 
 1. **Start with `marlin_landscape.json`** (if present) — **channel-keyed**: each `channels.<id>` holds that channel's `summary`, `urgent_signals`, themes, notables, and entities. Pick the channel relevant to the task, or scan across channels for breadth. The `delta` block says what moved since the prior snapshot. Gives you the shape of the domain in a few hundred tokens.
-2. **Use `inspect.py` for triage** — when you need more detail than the landscape but less than full records, run `python <skill-dir>/inspect.py` (add `--channel <id>` to focus, `--by-channel` to group, `--since-seq <N>` for arrivals, `--deadlines` for the radar, `--urgent-top` for the urgent set). Compact, always fits, newest first. These remain available as ad-hoc/debug views; the landscape pipeline no longer requires them.
+2. **Use `inspect.py` for triage** — when you need more detail than the landscape but less than full records, run `python <skill-dir>/inspect.py` (add `--channel <id>` to focus, `--by-channel` to group, `--since-seq <N>` for arrivals, `--deadlines` for the radar — its default view hides `handled` items; `--all` shows everything with status tags — `--urgent-top` for the urgent set). Compact, always fits, newest first. These remain available as ad-hoc/debug views; the landscape pipeline no longer requires them.
 3. **Drill selectively** — for specific signals you're citing, prefer `python <skill-dir>/inspect.py --ids sig_A,sig_B` for full `what_changed` / `why_it_matters` without parsing the state file.
 
 **The drill ladder — what a signal id is for.** Every id in the landscape can be walked four steps deep, each adding detail: **(1)** the landscape entry itself → **(2)** the full local record via `inspect.py --ids` (state, zero network) → **(3)** the source cluster — URLs, snippets, provenance — via MCP `get_signal(id)`, which is the specific purpose of a remote deep pull → **(4)** fetching the raw source content itself. The server keeps the full corpus, so `get_signal` resolves *any* id forever, including ones long gone from your window; locally, `inspect.py --ids` reads state first and **falls back to the archive automatically**, so one flag resolves current, superseded, and archived ids alike.
@@ -226,6 +244,9 @@ After syncing, use the three-layer pattern for any downstream work:
 Guidance:
 
 - When writing briefs or updates, check the relevant channel's `urgent_signals` first (or scan across channels), then `notable_signals`, then themes; use `delta` to lead with what moved.
+- **Render dated obligations as their own lane.** Urgent entries tagged `"via": "deadline"` were force-added by the mandatory-deadline rule — present them as an "on the clock" list next to, not mixed into, the incident/news urgents (a promo window expiring is not a peer of a security incident).
+- **Respect ack markers.** An urgent entry with `"ack": "acknowledged"` is a *known* item: one line, no fresh-news framing. When it's inside the final-nag window, phrase it as a final reminder ("due 2026-08-14 — you've noted this"), not a discovery. `handled` items never appear in these lists; do not resurrect them from themes into a brief's action section.
+- **Only render channels the landscape contains.** Never emit a section for a channel absent from `channels` — and a channel present but with empty urgents, themes, and notables is not a section either. No perpetual "Quiet." placeholders; if a channel is gone, it's gone.
 - When the user asks "what's new in AI?", start with `channels.ai_builder`'s `summary` and themes; drill only if they ask for more.
 - The `handling` field (in the triage index) suggests urgency: `urgent` and `brief` are likely worth surfacing; `watch` and `background` are for passive awareness.
 - Avoid Reading `marlin_state.json` top-to-bottom. After a cold-start sync it can exceed the Read tool's context cap.

@@ -7,6 +7,8 @@ import os
 WINDOW_SIZE = int(os.environ.get("MARLIN_WINDOW", "100"))
 # Test hooks only: MARLIN_* scrubs to MARLIN_* publicly; in-repo tests use MARLIN_* safely.
 CHANNEL_FLOOR = int(os.environ.get("MARLIN_CHANNEL_FLOOR", "10"))
+# A channel keeps its floor protection only while its newest signal is this recent.
+FLOOR_LIVENESS_DAYS = 21
 # Ordinary urgent entries per channel; deadline-radar mandatory additions are separate.
 URGENT_CAP = 5
 # Default forward horizon for the deadline radar.
@@ -15,6 +17,10 @@ RADAR_HORIZON_DAYS = 21
 MANDATORY_URGENT_DAYS = 14
 # Recently passed deadlines remain visible on the radar for this many days.
 DEADLINE_TAIL_DAYS = 7
+# An acknowledged deadline re-escalates only inside this final window (Step 3).
+ACK_FINAL_NAG_DAYS = 3
+# Expired ack records leave the current-state store after this many days.
+ACK_EXPIRED_PRUNE_DAYS = 90
 # Archive history considered while proposing slow-accreting themes.
 ARCHIVE_LOOKBACK_DAYS = 14
 # Minimum total in-window plus archived members for a proposed theme birth.

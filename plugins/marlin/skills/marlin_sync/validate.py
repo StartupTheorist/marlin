@@ -26,6 +26,9 @@ Checks:
     is complete: every qualifying entity is listed (S12).
   * urgent_signals — ≤5 per channel; sorted importance desc / updated_seq desc;
     every referenced signal is handling=urgent in state.
+  * ack state (v3) — a `handled` or `expired` signal must not appear in
+    urgent_signals / notable_signals; the optional `ack` value is allowlisted
+    per surface, and the `via` deadline-lane marker only on urgent_signals.
   * top-level — `as_of` is ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`; `updated_through_seq`
     equals max(updated_seq) over all signals in state.
   * cross_channel (if present) — linked_events reference real IDs spanning ≥2
@@ -49,8 +52,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from inspect import _deadline_radar, _parse_deadline_date
+from ack import effective_statuses, load_ack_store
+from inspect import _deadline_radar, _load_archive as _load_archive_records, _parse_deadline_date, _recent_archive_months
 from params import MANDATORY_URGENT_DAYS, URGENT_CAP
+
+# Per-surface allowlists for the v3 optional annotation fields. `acknowledged`
+# is the only ack value that ever reaches a written surface: `open` carries no
+# marker, and `handled`/`expired` are suppressed out of these lists entirely.
+ALLOWED_ACK = {"urgent_signals": {"acknowledged"}, "notable_signals": {"acknowledged"}}
+# I21's deadline-lane marker. Only the urgent surface carries it, and only the
+# mandatory-deadline rule sets it.
+ALLOWED_VIA = {"deadline"}
+SUPPRESSED_ACK = {"handled", "expired"}
 
 # Both files live in the shared state directory (MARLIN_STATE_DIR, else
 # ~/.marlin), the same one sync.py/inspect.py resolve — so the validator lints
@@ -83,6 +96,17 @@ def _as_float(v: object) -> float:
 def _is_active(s: dict) -> bool:
     """A8b: a retired (superseded) signal must not appear in the landscape."""
     return s.get("status", "active") == "active"
+
+
+def _parse_as_of(as_of: object) -> datetime:
+    """Return the landscape's own synthesis time, falling back to the wall clock."""
+    if isinstance(as_of, str) and as_of.strip():
+        try:
+            parsed = datetime.fromisoformat(as_of.strip().replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
 
 
 def _theme_key(signal_ids: list[str], by_id: dict[str, dict]) -> tuple[float, int, int]:
@@ -137,13 +161,37 @@ def validate(landscape: dict, state: dict) -> list[str]:
         )
 
     channels = landscape.get("channels")
-    if not isinstance(channels, dict) or not channels:
-        v.append("channels is missing or empty")
+    if not isinstance(channels, dict):
+        v.append("channels is missing or not an object")
         return v
+    # An EMPTY channels object is legal, not a violation: once the emptiness
+    # filter stopped resurrecting dead channels, "nothing to say" became a
+    # reachable end state (every channel emptied, or a cold start with no
+    # signals). Rejecting it left the pipeline unable to complete that
+    # transition at all.
 
+    # Every time-dependent check below is anchored to the landscape's own
+    # `as_of`, not to the wall clock. Finish evaluates the deadline band once,
+    # writes the file, and validate runs seconds later — across UTC midnight
+    # those are different days, and the validator would reject a file that was
+    # correct when it was written.
+    anchor = _parse_as_of(as_of)
     archive_by_id = _load_archive() if version == 3 else {}
+    # The written surfaces must already reflect suppression, so the validator
+    # resolves ack state the same way the finish step did — one shared helper,
+    # read-only. A missing or unreadable store simply means "no acks".
+    ack_statuses: dict[str, str] = {}
+    if version == 3:
+        try:
+            # The same bounded archive coverage the finish step resolved
+            # against — current + prior month, never the whole archive — so
+            # producer and validator cannot disagree about what has expired.
+            radar_archive, _skipped = _load_archive_records(only_months=_recent_archive_months(anchor))
+            ack_statuses = effective_statuses(load_ack_store(STATE_DIR), signals, anchor, radar_archive)
+        except ValueError:
+            ack_statuses = {}
     for cid, section in channels.items():
-        v.extend(_validate_channel(cid, section, by_id, archive_by_id, version == 3))
+        v.extend(_validate_channel(cid, section, by_id, archive_by_id, version == 3, ack_statuses, anchor))
 
     if version == 3 and "delta" in landscape:
         delta = landscape["delta"]
@@ -158,8 +206,18 @@ def validate(landscape: dict, state: dict) -> list[str]:
     return v
 
 
-def _validate_channel(cid: str, section: dict, by_id: dict[str, dict], archive_by_id: dict[str, dict], v3: bool) -> list[str]:
+def _validate_channel(
+    cid: str,
+    section: dict,
+    by_id: dict[str, dict],
+    archive_by_id: dict[str, dict],
+    v3: bool,
+    ack_statuses: dict[str, str] | None = None,
+    anchor: datetime | None = None,
+) -> list[str]:
     v: list[str] = []
+    ack_statuses = ack_statuses or {}
+    anchor_date = (anchor or datetime.now(timezone.utc)).astimezone(timezone.utc).date()
     if not isinstance(section, dict):
         return [f"[{cid}] section is not an object"]
 
@@ -280,7 +338,7 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict], archive_b
             deadline = _parse_deadline_date(s.get("deadline_at"))
             # A brief signal may appear here only when its deadline is inside the
             # mandatory band.  This is the v3 exception to the v2 handling rule.
-            mandatory = v3 and deadline is not None and 0 <= (deadline - datetime.now(timezone.utc).date()).days <= MANDATORY_URGENT_DAYS
+            mandatory = v3 and deadline is not None and 0 <= (deadline - anchor_date).days <= MANDATORY_URGENT_DAYS
             if s.get("handling") != "urgent" and not mandatory:
                 v.append(
                     f"[{cid}] urgent_signals includes {sid!r} whose handling is "
@@ -307,14 +365,37 @@ def _validate_channel(cid: str, section: dict, by_id: dict[str, dict], archive_b
             if _ref_ok(sid, "notable_signals"):
                 if by_id[sid].get("handling") != "brief":
                     v.append(f"[{cid}] notable_signals includes {sid!r} whose handling is not 'brief'")
-            ack = notable.get("ack")
-            if ack is not None and ack != "acknowledged":
-                v.append(f"[{cid}] notable_signals ack must be 'acknowledged'")
-        for item in urgent:
-            ack = item.get("ack")
-            if ack is not None and ack != "acknowledged":
-                v.append(f"[{cid}] urgent_signals ack must be 'acknowledged'")
+        v.extend(_validate_ack_fields(cid, "notable_signals", section.get("notable_signals") or [], ack_statuses))
+        v.extend(_validate_ack_fields(cid, "urgent_signals", urgent, ack_statuses))
 
+    return v
+
+
+def _validate_ack_fields(cid: str, surface: str, entries: list[dict], ack_statuses: dict[str, str]) -> list[str]:
+    """Check the v3 ack/via annotations and the suppression rule on one surface."""
+    v: list[str] = []
+    allowed = ALLOWED_ACK.get(surface, set())
+    for entry in entries:
+        sid = entry.get("id", "?")
+        ack = entry.get("ack")
+        if ack is not None and ack not in allowed:
+            v.append(
+                f"[{cid}] {surface} entry {sid!r} has ack {ack!r}; "
+                f"allowed here: {sorted(allowed) or 'none'}"
+            )
+        via = entry.get("via")
+        if via is not None and (surface != "urgent_signals" or via not in ALLOWED_VIA):
+            v.append(
+                f"[{cid}] {surface} entry {sid!r} has via {via!r}; "
+                f"allowed: {sorted(ALLOWED_VIA)} on urgent_signals only"
+            )
+        effective = ack_statuses.get(sid)
+        if effective in SUPPRESSED_ACK:
+            v.append(
+                f"[{cid}] {surface} includes {sid!r}, whose ack state is "
+                f"{effective!r} — handled and expired signals must be suppressed "
+                "from the action surfaces (S13)"
+            )
     return v
 
 
