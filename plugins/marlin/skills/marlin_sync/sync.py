@@ -214,21 +214,41 @@ def _channel_is_live(channel_signals: list[dict], cutoff: datetime) -> bool:
 
 
 def _floored_trim(
-    signals: Iterable[dict], window: int, floor: int, now: datetime | None = None
+    signals: Iterable[dict], window: int, floor: int, now: datetime | None = None,
+    delivered_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict], int]:
-    """Keep a newest-first window while reserving active slots per live channel."""
+    """Keep a newest-first window while reserving active slots per live channel.
+
+    A newly delivered retired record stays for this sync so the landscape can
+    classify its supersede. On the next sync it is archived before any active
+    record is considered for eviction. Retired records never earn floor slots.
+    """
+    delivered_ids = delivered_ids or set()
     ordered = sorted(
         signals,
         key=lambda s: (s.get("updated_seq", 0), s.get("id", "")),
         reverse=True,
     )
-    if len(ordered) <= window:
-        return ordered, [], 0
+
+    stale_retired = [
+        signal for signal in ordered
+        if signal.get("status", "active") != "active"
+        and signal.get("id") not in delivered_ids
+    ]
+    current_retired = [
+        signal for signal in ordered
+        if signal.get("status", "active") != "active"
+        and signal.get("id") in delivered_ids
+    ]
+    active = [
+        signal for signal in ordered if signal.get("status", "active") == "active"
+    ]
+    candidates = current_retired + active
+    if len(candidates) <= window:
+        return sorted(candidates, key=lambda s: (s.get("updated_seq", 0), s.get("id", "")), reverse=True), stale_retired, 0
 
     channels: dict[object, list[dict]] = {}
-    for signal in ordered:
-        if signal.get("status", "active") != "active":
-            continue
+    for signal in active:
         channels.setdefault(signal.get("channel"), []).append(signal)
 
     # A dead channel neither receives protection nor dilutes anyone else's: it
@@ -236,23 +256,24 @@ def _floored_trim(
     # live quiet channel's floor toward zero (I17's second-order effect).
     cutoff = (now or datetime.now(timezone.utc)).astimezone(timezone.utc) - timedelta(days=FLOOR_LIVENESS_DAYS)
     live = [signals for signals in channels.values() if _channel_is_live(signals, cutoff)]
-    effective_floor = min(floor, window // max(1, len(live)))
+    active_slots = max(0, window - len(current_retired))
+    effective_floor = min(floor, active_slots // max(1, len(live)))
     protected_ids: set[object] = set()
     for channel_signals in live:
         protected_ids.update(
             signal.get("id") for signal in channel_signals[:effective_floor]
         )
 
-    protected = [signal for signal in ordered if signal.get("id") in protected_ids]
-    unprotected = [signal for signal in ordered if signal.get("id") not in protected_ids]
+    protected = [signal for signal in active if signal.get("id") in protected_ids]
+    unprotected = [signal for signal in active if signal.get("id") not in protected_ids]
     kept = sorted(
-        protected + unprotected[: window - len(protected)],
+        current_retired + protected + unprotected[: active_slots - len(protected)],
         key=lambda s: (s.get("updated_seq", 0), s.get("id", "")),
         reverse=True,
     )
     kept_ids = {signal.get("id") for signal in kept}
     evicted = [signal for signal in ordered if signal.get("id") not in kept_ids]
-    plain_kept_ids = {signal.get("id") for signal in ordered[:window]}
+    plain_kept_ids = {signal.get("id") for signal in candidates[:window]}
     floor_protected_count = sum(
         signal.get("id") not in plain_kept_ids for signal in kept
     )
@@ -300,6 +321,7 @@ def main() -> None:
     new_count = 0
     reupdated_count = 0
     superseded_count = 0
+    delivered_ids: set[str] = set()
     next_cursor = cursor
     pages = 0
     while True:
@@ -308,6 +330,7 @@ def main() -> None:
             sid = s.get("id")
             if not sid:
                 continue
+            delivered_ids.add(sid)
             existing = signals_by_id.get(sid)
             if existing is None:
                 signals_by_id[sid] = s
@@ -329,7 +352,12 @@ def main() -> None:
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)  # ensure the state dir exists before writing
 
-    if new_count == 0 and reupdated_count == 0:
+    stale_retired_present = any(
+        signal.get("status", "active") != "active"
+        and signal.get("id") not in delivered_ids
+        for signal in signals_by_id.values()
+    )
+    if new_count == 0 and reupdated_count == 0 and not stale_retired_present:
         state["version"] = 1
         state["last_sync"] = now
         if next_cursor:
@@ -344,7 +372,7 @@ def main() -> None:
         return
 
     trimmed, evicted, floor_protected = _floored_trim(
-        signals_by_id.values(), WINDOW, FLOOR
+        signals_by_id.values(), WINDOW, FLOOR, delivered_ids=delivered_ids
     )
 
     if evicted:

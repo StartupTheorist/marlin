@@ -21,9 +21,9 @@ Checks:
   * active_themes order — matches the composite sort key (max importance desc,
     then signal_ids count desc, then max updated_seq desc).
   * entities_to_watch — each entity appears in ≥2 of the channel's signals,
-    verbatim from `entity_tags`, and is not named in any of the channel's
-    theme strings; listed signal_ids actually carry the entity; and the set
-    is complete: every qualifying entity is listed (S12).
+    verbatim from `entity_tags`, and is not a theme subject (by title or
+    member-tag dominance); listed signal_ids actually carry the entity; and
+    the set is complete: every qualifying entity is listed (S12).
   * urgent_signals — ≤5 per channel; sorted importance desc / updated_seq desc;
     every referenced signal is handling=urgent in state.
   * ack state (v3) — a `handled` or `expired` signal must not appear in
@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ack import effective_statuses, load_ack_store
-from inspect import _deadline_radar, _load_archive as _load_archive_records, _parse_deadline_date, _recent_archive_months
+from inspect import _load_archive as _load_archive_records, _parse_deadline_date, _recent_archive_months, entities_to_watch
 from params import MANDATORY_URGENT_DAYS, URGENT_CAP
 
 # Per-surface allowlists for the v3 optional annotation fields. `acknowledged`
@@ -281,7 +281,11 @@ def _validate_channel(
             )
 
     # --- entities_to_watch ---
-    theme_blob = " ".join(theme_names).lower()
+    # This shared helper owns both title and member-tag subject exclusions.
+    # Calling it here keeps validation identical to assemble and inspect.
+    expected_entities = {
+        entry["entity"]: entry for entry in entities_to_watch(chan_signals, themes)
+    }
     for e in section.get("entities_to_watch") or []:
         ent = e.get("entity", "")
         sids = e.get("signal_ids") or []
@@ -293,34 +297,27 @@ def _validate_channel(
                         f"[{cid}] entity {ent!r} not in entity_tags of its "
                         f"listed signal {sid!r}"
                     )
-        count = sum(1 for s in chan_signals if ent in (s.get("entity_tags") or []))
-        if count < 2:
-            v.append(
-                f"[{cid}] entity {ent!r} appears in {count} signal(s); rule "
-                "requires ≥2 in the channel"
-            )
-        if ent and ent.lower() in theme_blob:
-            v.append(
-                f"[{cid}] entity {ent!r} is named in a theme string; "
-                "entities_to_watch excludes theme subjects"
-            )
+        if ent not in expected_entities:
+            count = sum(1 for s in chan_signals if ent in (s.get("entity_tags") or []))
+            if count < 2:
+                v.append(
+                    f"[{cid}] entity {ent!r} appears in {count} signal(s); rule "
+                    "requires ≥2 in the channel"
+                )
+            else:
+                v.append(
+                    f"[{cid}] entity {ent!r} is a theme subject; "
+                    "entities_to_watch excludes theme subjects"
+                )
 
-    # --- entities_to_watch: completeness (S12) — every qualifying entity
-    # (≥2 signals, not a theme subject) must be listed, not just the listed
-    # ones sound. Recomputes the same qualifying set inspect.py's
-    # --entity-candidates emits.
+    # --- entities_to_watch: completeness (S12) — use inspect.py's shared
+    # helper so title and member-tag subject exclusions cannot drift.
     listed_entities = {e.get("entity", "") for e in section.get("entities_to_watch") or []}
-    ids_by_entity: dict[str, list[str]] = {}
-    for s in chan_signals:
-        for ent in dict.fromkeys(s.get("entity_tags") or []):
-            ids_by_entity.setdefault(ent, []).append(s.get("id"))
-    for ent, sids in ids_by_entity.items():
-        if len(sids) < 2 or ent.lower() in theme_blob:
-            continue
+    for ent, expected in expected_entities.items():
         if ent not in listed_entities:
             v.append(
                 f"[{cid}] entity {ent!r} qualifies for entities_to_watch "
-                f"({len(sids)} signals, not a theme subject) but is missing "
+                f"({len(expected['signal_ids'])} signals, not a theme subject) but is missing "
                 "— the set must be complete (S12)"
             )
 

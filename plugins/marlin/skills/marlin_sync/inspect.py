@@ -40,19 +40,19 @@ skill's rules require, so the agent doesn't do it by hand):
                           `entities_to_watch` under the count rule (appear in
                           ≥2 signals in that channel), names taken verbatim
                           from `entity_tags`, with supporting signal IDs.
-                          With `--channel <id> --themes <blob>` also given,
+                          With `--channel <id> --themes <JSON>` also given,
                           instead emits the final paste-ready
                           `entities_to_watch` JSON array for that one channel
                           — the theme-subject exclusion applied, the set
                           complete (no top-N cap) — meant to be pasted
                           verbatim as the channel's `entities_to_watch`.
-        --themes <blob>       The channel's draft theme names, joined into
-                               one string (any separator; matched as a
-                               lowercased substring check, same as
-                               validate.py). Only meaningful with
-                               --entity-candidates and --channel; without
-                               --channel the "final set" is undefined
-                               (entities_to_watch is per-channel).
+        --themes <JSON>       The channel's draft themes as a JSON array of
+                               `{theme, signal_ids}` objects. A legacy plain
+                               title blob remains accepted for title matching,
+                               but cannot apply member-based subject exclusion.
+                               Only meaningful with --entity-candidates and
+                               --channel; without --channel the final set is
+                               undefined (entities_to_watch is per-channel).
     --urgent-top [N]      Per channel, list `handling=urgent` signals with the
                           deterministic sort applied (importance desc, ties by
                           updated_seq desc), capped at N (default 5), noting any
@@ -741,14 +741,46 @@ def _print_entity_candidates(signals: list[dict]) -> None:
             print(f"{ent}\t{len(ids)}\t{','.join(ids)}")
 
 
-def entities_to_watch(chan_signals: list[dict], themes_blob: str) -> list[dict]:
-    """Return the final deterministic entities_to_watch value for one channel."""
+def _theme_subject_entities(chan_signals: list[dict], themes: list[dict]) -> set[str]:
+    """Return entities that dominate one multi-member theme's tags.
+
+    An entity is a subject when it occurs in entity_tags of more than half of
+    the member signals of any theme containing at least two members.
+    Tags are de-duplicated per signal, matching _qualifying_entities.
+    """
+    by_id = {signal.get("id"): signal for signal in chan_signals}
+    subjects: set[str] = set()
+    for theme in themes:
+        member_ids = list(dict.fromkeys(theme.get("signal_ids") or []))
+        if len(member_ids) < 2:
+            continue
+        counts: dict[str, int] = {}
+        for signal_id in member_ids:
+            signal = by_id.get(signal_id)
+            if signal is None:
+                continue
+            for entity in dict.fromkeys(signal.get("entity_tags") or []):
+                counts[entity] = counts.get(entity, 0) + 1
+        subjects.update(
+            entity for entity, count in counts.items() if count > len(member_ids) / 2
+        )
+    return subjects
+
+
+def entities_to_watch(chan_signals: list[dict], themes: list[dict]) -> list[dict]:
+    """Return the final deterministic entities_to_watch value for one channel.
+
+    Themes are structured `{theme, signal_ids}` records, so this one function
+    owns both subject exclusions: a literal title match and member-tag
+    dominance in a theme with at least two members.
+    """
     qualifying = _qualifying_entities(chan_signals)
-    blob = themes_blob.lower()
+    blob = " ".join(str(theme.get("theme") or "") for theme in themes).lower()
+    dominant_subjects = _theme_subject_entities(chan_signals, themes)
     by_id = {s.get("id"): s for s in chan_signals}
     result = []
     for ent in sorted(qualifying, key=lambda e: (-len(qualifying[e]), e)):
-        if ent.lower() in blob:
+        if ent.lower() in blob or ent in dominant_subjects:
             continue
         ids = sorted(
             qualifying[ent], key=lambda sid: by_id[sid].get("updated_seq", 0), reverse=True
@@ -757,14 +789,26 @@ def entities_to_watch(chan_signals: list[dict], themes_blob: str) -> list[dict]:
     return result
 
 
-def _print_entity_candidates_final(chan_signals: list[dict], themes_blob: str) -> None:
+def _print_entity_candidates_final(chan_signals: list[dict], themes: list[dict]) -> None:
     """The final paste-ready entities_to_watch JSON array for ONE channel
     (S12): qualifying entities (≥2 signals, same rule as
-    _qualifying_entities) minus those named in the channel's theme blob —
-    `ent.lower()` as a substring of `themes_blob.lower()`, matching
-    validate.py's theme_blob check exactly. Sorted count desc then entity
-    name asc; each entry's signal_ids sorted by updated_seq descending."""
-    print(json.dumps(entities_to_watch(chan_signals, themes_blob), indent=2))
+    _qualifying_entities) minus theme subjects. A subject is either named in a
+    theme title or appears in more than half of one theme's member tags.
+    Sorted count desc then entity name asc; each entry's signal_ids sorted by
+    updated_seq descending."""
+    print(json.dumps(entities_to_watch(chan_signals, themes), indent=2))
+
+
+def _themes_from_arg(value: object) -> list[dict]:
+    """Decode --themes structured data, retaining legacy title-blob support."""
+    raw = str(value)
+    try:
+        themes = json.loads(raw)
+    except json.JSONDecodeError:
+        return [{"theme": raw, "signal_ids": []}]
+    if not isinstance(themes, list) or not all(isinstance(theme, dict) for theme in themes):
+        _die("--themes must be a JSON array of {theme, signal_ids} objects")
+    return themes
 
 
 def _print_urgent_top(signals: list[dict], n: int) -> None:
@@ -959,7 +1003,7 @@ def main() -> None:
                     "entities_to_watch set, which is per-channel; pass "
                     "--channel <id>"
                 )
-            _print_entity_candidates_final(signals, str(args["themes"]))
+            _print_entity_candidates_final(signals, _themes_from_arg(args["themes"]))
         else:
             _print_entity_candidates(signals)
         return
