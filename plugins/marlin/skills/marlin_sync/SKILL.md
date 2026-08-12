@@ -149,14 +149,14 @@ Five steps: **`--pre` → your membership draft → `--finish` → your prose ma
       "active_themes":   [ {"theme": "<name>", "trend": "<computed>", "signal_ids": [...],
                             "named_member_ids": [...], "prior_support": {...}, "formerly": [...] } ],
       "notable_signals": [ {"id": "sig_…", "title": "<copied>"} ],
-      "entities_to_watch": [ {"entity": "<verbatim tag>", "signal_ids": [...]} ]
+      "entities_to_watch": [ {"entity": "<served entity name>", "signal_ids": [...], "family": "<family root, when it has one>"} ]
     }
   },
   "delta": { "since": "<prior as_of>", "channels": { "<channel_id>": {"added_signal_ids": [], "dropped_signal_ids": [], "theme_rank_changes": []} } }
 }
 ```
 
-Field notes for consumers: `trend` is computed from member ages and measures **storyline age, not theme-record age** — a theme created today from a cluster with weeks of archived support correctly reads `stable`, not `emerging`; `notable_signals` are important one-offs that fit no theme; `prior_support` records the storyline's archived history (`{count, since, ids}` — a brand-new theme can legitimately carry it; resolve those ids via `inspect.py --ids`, which falls back to the archive, or MCP `get_signal`); `formerly` preserves a renamed theme's old names; `named_member_ids` is internal lifecycle bookkeeping; `delta` says what moved since the prior snapshot (`since` is its baseline). Urgent/notable entries may carry `"ack": "acknowledged"` (a user-known item — see the acks section) and urgent entries may carry `"via": "deadline"` (force-added by the mandatory-deadline rule — the dated-obligations lane). `cross_channel` remains reserved for linked cross-channel events; the current pipeline does not emit it.
+Field notes for consumers: `trend` is computed from member ages and measures **storyline age, not theme-record age** — a theme created today from a cluster with weeks of archived support correctly reads `stable`, not `emerging`; `notable_signals` are important one-offs that fit no theme; `prior_support` records the storyline's archived history (`{count, since, ids}` — a brand-new theme can legitimately carry it; resolve those ids via `inspect.py --ids`, which falls back to the archive, or MCP `get_signal`); `formerly` preserves a renamed theme's old names; `named_member_ids` is internal lifecycle bookkeeping; an `entities_to_watch` entry carries `family` when the server places that entity under a parent (`Claude Opus` sits in the `Anthropic` family), and omits the key when it does not — the server resolves every entity name to one canonical form, so the same product never appears twice under two spellings; `delta` says what moved since the prior snapshot (`since` is its baseline). Urgent/notable entries may carry `"ack": "acknowledged"` (a user-known item — see the acks section) and urgent entries may carry `"via": "deadline"` (force-added by the mandatory-deadline rule — the dated-obligations lane). `cross_channel` remains reserved for linked cross-channel events; the current pipeline does not emit it.
 
 ## Acknowledgements — recording what the user has seen or handled
 

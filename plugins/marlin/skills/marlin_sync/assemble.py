@@ -259,7 +259,19 @@ def unthemed_pool(
 
 
 def _comparison_keys(signal: dict) -> set[str]:
+    """Return the keys two signals are compared on for clustering.
+
+    The server annotates each signal with its entity families. The shipped
+    shape is a MAP from each served entity name to its family root, and the map
+    is total — an entity with no family maps to itself — so swapping tag keys
+    for family keys folds siblings together without dropping anything. A bare
+    string or list is still accepted (the earlier annotation shapes).
+    """
     family = (signal.get("annotations") or {}).get("family")
+    if isinstance(family, dict) and family:
+        keys = {f"family:{root}" for root in family.values() if isinstance(root, str) and root}
+        if keys:
+            return keys
     if isinstance(family, str) and family.strip():
         return {f"family:{family.strip()}"}
     if isinstance(family, list) and family:
