@@ -767,16 +767,45 @@ def _theme_subject_entities(chan_signals: list[dict], themes: list[dict]) -> set
     return subjects
 
 
+def _family_by_entity(chan_signals: list[dict]) -> dict[str, str]:
+    """Collect the server's entity→family map from the channel's signals.
+
+    Each signal carries `annotations.family`, a map from every one of its served
+    entity names to that entity's family root. The map is total, so an entity
+    with no family maps to itself; those self-mappings are dropped here because
+    a watchlist row only needs a `family` key when the entity sits under a
+    parent. Signals agree on the mapping (the server derives it from one
+    registry), so a first-seen wins rule is deterministic.
+    """
+    families: dict[str, str] = {}
+    for signal in chan_signals:
+        annotation = (signal.get("annotations") or {}).get("family")
+        if not isinstance(annotation, dict):
+            continue
+        for entity, family in annotation.items():
+            if not isinstance(entity, str) or not isinstance(family, str):
+                continue
+            if not family or family == entity:
+                continue
+            families.setdefault(entity, family)
+    return families
+
+
 def entities_to_watch(chan_signals: list[dict], themes: list[dict]) -> list[dict]:
     """Return the final deterministic entities_to_watch value for one channel.
 
     Themes are structured `{theme, signal_ids}` records, so this one function
     owns both subject exclusions: a literal title match and member-tag
     dominance in a theme with at least two members.
+
+    An entry also carries `family` when the server places that entity under a
+    parent (`Claude Opus` → `Anthropic`), so a renderer can fold siblings
+    together. Entities with no family have no `family` key.
     """
     qualifying = _qualifying_entities(chan_signals)
     blob = " ".join(str(theme.get("theme") or "") for theme in themes).lower()
     dominant_subjects = _theme_subject_entities(chan_signals, themes)
+    families = _family_by_entity(chan_signals)
     by_id = {s.get("id"): s for s in chan_signals}
     result = []
     for ent in sorted(qualifying, key=lambda e: (-len(qualifying[e]), e)):
@@ -785,7 +814,10 @@ def entities_to_watch(chan_signals: list[dict], themes: list[dict]) -> list[dict
         ids = sorted(
             qualifying[ent], key=lambda sid: by_id[sid].get("updated_seq", 0), reverse=True
         )
-        result.append({"entity": ent, "signal_ids": ids})
+        entry = {"entity": ent, "signal_ids": ids}
+        if ent in families:
+            entry["family"] = families[ent]
+        result.append(entry)
     return result
 
 
